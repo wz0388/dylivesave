@@ -1,0 +1,6 @@
+requests>=2.31.0
+
+# 录完自动投稿到 B 站（bili_uploader.py
+# 注意包名带 -python 后缀；装成 bilibili_api 会拿到 2021 年的旧包，Python 3.12 上编译不过
+bilibili-api-python>=17.0.0
+qrcode-terminal>=0.8

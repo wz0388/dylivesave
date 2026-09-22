@@ -1,0 +1,45 @@
+# ============================================================
+#  B 站投稿配置（record.py 录完直播后自动投稿用）
+#  Windows 路径请用单引号，反斜杠不会被转义。
+# ============================================================
+
+[bili]
+enabled = true                 # 录完是否自动投稿；命令行 --no-bili 可临时关掉
+credential_file = 'bili_credential.json'   # 登录态；相对本配置文件所在目录
+tid = 21                       # 分区 id：21 日常 / 138 搞笑 / 4 游戏 / 181 影视
+tags = ["直播回放"]             # 标签 1~10 个
+original = true                # true=原创
+no_reprint = true              # true=禁止转载
+
+# 标题/简介模板，可用占位符：
+#   {anchor} 主播昵称   {title} 直播间标题   {date} 日期   {time} 时间
+#   {datetime} 日期时间   {quality} 清晰度   {room_id} 房间号
+#   {seg} 这是第几段   {segments} 总段数
+#
+# 注意 {date}/{time}/{datetime} 取的是**这一段录制的开始时间**（不是投稿时间）——
+# 录播按 2 小时分段后，靠它区分同一天的多个稿件。
+# 一定要带上 {time}，否则同一天的多段标题会重复，B 站会拒（短时间内标题不能相同）。
+title_template = "{anchor} 直播回放 {date} {time}"
+desc_template = """{anchor} 的直播回放（第 {seg}/{segments} 段）
+直播间：https://live.douyin.com/{room_id}
+本段开始：{datetime}
+清晰度：{quality}"""
+
+cover_position = 0             # 封面取第几秒的画面；0 = 视频第一帧
+container = 'ts'               # ts = 直接传（B 站云端转码，推荐）；mp4 = 先无损转封装再传
+keep_mp4 = true                # container=mp4 时，转出来的 mp4 是否保留（原 ts 始终保留）
+min_size_mb = 1                # 小于这个体积的片段不投稿，防止把空文件传上去
+
+[season]
+# ── 每个主播一个合集 ──
+enabled = true
+# 合集名模板：{anchor} 替换成主播昵称。
+#   想要「主播各自一个合集」就保留 "{anchor}"；
+#   想让所有主播都进同一个合集，就写成固定名字，例如 '直播回放'
+name_template = "{anchor}"
+create_if_missing = true       # 合集不存在就自动新建（新建要传封面，B站有人工审核）
+desc_template = "{anchor} 的直播回放合集"
+
+# 单独给某些主播指定合集名（优先级高于上面的模板），按需打开注释改
+[season.anchors]
+# "黄同学书屋" = "黄同学书屋的直播回放"

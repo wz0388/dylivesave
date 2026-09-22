@@ -1,0 +1,4 @@
+﻿vendor/ab_sign.py —— a_bogus 签名的纯 Python 实现
+来源：https://github.com/ihmily/DouyinLiveRecorder
+许可：MIT（Copyright (c) 2025 Hmily），原文见同目录 LICENSE-ab_sign.txt
+本项目只使用了该文件的签名算法实现，未做修改/仅作最小适配。
