@@ -1,9 +1,11 @@
 # 抖音直播录制 → B 站自动投稿
 
 拉取抖音直播间的视频流，交给 ffmpeg **原样封装成 TS**（`-c copy`，不解码不重编码），
-**录完自动投稿到 B 站**，封面统一取视频第一帧（不管合集）。
+录完**自动投稿到 B 站**，封面统一取视频第一帧。
 
-只做两件事：**录制** 和 **上传**。不含弹幕 / 礼物。
+只做两件事：**录制** 和 **投稿**。不含弹幕 / 礼物。
+
+单文件 exe，**ffmpeg 已打包在内**，拷到哪都能用。许可说明见 **[第六节](#六第三方组件与许可)**。
 
 ---
 
@@ -18,7 +20,7 @@
 
 ## 需要什么
 
-**用打包好的 exe**：什么都不用装 —— **ffmpeg 已经打进 exe 里了**，拷到哪都能用。
+**用打包好的 exe**：什么都不用装 —— ffmpeg 已经在里面了。
 
 **从源码跑**：
 
@@ -38,27 +40,53 @@ pip install -r requirements.txt
 
 双击 `RecorderUploader.exe`（或 `python record_gui.py`）。
 
-**可以多个主播同时录**：主播列表里填几个就录几个，「全部开始」一次全起，
-一人一个后台线程，互不影响；日志每行开头带 `[房间号]`，分得清是谁的。
-每行能单独设清晰度，分段时间 / 时长 / 目录 / 没开播时的行为这些是所有人共用的。
+### 主播列表：可以多个同时录
 
-**录制中随时增删主播**：
+主播列表里填几个就录几个，「全部开始」一次全起，一人一个后台线程，互不影响。
+日志每行开头带 `[房间号]`，分得清是谁的。每行能单独设清晰度；
+分段时间 / 时长 / 目录 / 没开播时的行为这些是所有人共用的。
 
-- 「+ 添加主播」随时能点，新加的行填上房间号点它的「开始」就录上了，其它主播照常；
+**录制中随时增删主播：**
+
+- 「+ 添加主播」随时能点，新行填上房间号、点它自己的「开始」就录上了，其它主播照常；
 - 某一行点「删」只停掉并移除这一路，**其它主播继续录**；
-- 正在跑的那一行会锁住房间号和清晰度（改了也没用），其它行随便改。
+- 正在跑的那一行会锁住房间号和清晰度（改了没用），其它行随便改。
+
+### 录制的行为
 
 - **分段一录完就上传**：一段录完立刻交给后台上传队列，录制线程接着录下一段，
-  不用等整场直播结束。**上传进度显示在状态栏**（`后台上传 42%`），不刷日志。
+  不用等整场直播结束。上传是**后台串行**的，不阻塞任何一路录制。
 - **下播后自动进入监控状态**：主播下播了不停，每 30 秒查一次，开播了自动接着录下一场，
   适合长期值守。指定了「录制时长」的是一次性任务，录满就停（不监控）。
-- **没开播时默认一直等，每 30 秒重试一次拉流**，直到开播或你点停止。
+- **没开播时默认一直等**，每 30 秒重试一次拉流，直到开播或你点停止。
   也可以改成「最多等 N 分钟」或「没开播就直接结束」。
-- **B 站扫码登录**：点「B 站扫码登录」，二维码直接显示在界面里，手机扫码确认即可，
-  不用命令行。
 - **停止**：优雅收尾 —— 给 ffmpeg 发中断、把当前 TS 写完整，然后照常投稿。
-- 设置自动记住，存在 exe 同目录的 `record_gui.json`。
-- 日志同时写一份到 exe 同目录的 `logs/gui.log`：界面起不来时把这个文件发出来就能定位。
+
+### 日志分两个分页
+
+| 分页 | 内容 |
+|---|---|
+| **录制日志** | 录制相关的一切（开播检测、拉流、分段、断流重连、停止…） |
+| **上传** | 每段一张进度表（段号 / 主播 / 状态 / 进度）+ 投稿专属日志 |
+
+- 「上传」页的进度表显示 **`12%（25/205 块）`** —— B 站固定 10MB 一块，
+  2GB 的录播有 205 块，只看百分比会长时间停在 0%，带上块数从第一块就看得出在动。
+- 投稿失败的段在表里标 `✗ 失败（可补传）`；点「**补传**」按原参数重投。
+  重启后启动时也会把 `bili_failed_uploads.json` 里没补上的段填进来。
+- **所有日志行都带 `[HH:MM:SS]` 时间戳**；两个分页各写各的，同时也写一份到
+  `logs/gui.log`（界面起不来时把这个文件发出来就能定位）。
+- 状态栏显示 `录制中：2 路（后台上传 42%（86/205 块））` / `录制结束，等后台上传：…`。
+
+### B 站扫码登录
+
+点「B 站扫码登录」，二维码直接显示在窗口里，手机扫码确认即可，不用命令行。
+
+登录状态显示在界面上，而且是**实测**出来的（不是只看文件里有没有字段）：
+`正常 · 昵称` 或 `已失效，点右边「B 站扫码登录」重登`。
+
+### 设置
+
+自动记住，存在 exe 同目录的 `record_gui.json`。
 
 > exe 读的是 **exe 同目录** 的 `bili.toml` / `cookie.txt` / `bili_credential.json`，
 > 录制产物默认也写到 exe 同目录的 `recordings/`。所以把 exe 放进项目目录里用最省事。
@@ -71,17 +99,15 @@ python build_record_exe.py            # 或双击 build_record_exe.bat
 
 产物 `dist/RecorderUploader.exe`（单文件，**ffmpeg 已打进去**，约 60MB）。
 
-- 打包脚本会自动找 PATH 里的 ffmpeg 并 `--add-binary` 进去；运行时优先用
-  exe 里那份（`find_ffmpeg()` 的优先级：手动指定 > exe 内置 > PATH）。
+- 打包脚本自动找 PATH 里的 ffmpeg 并 `--add-binary` 进去；运行时优先用 exe 里那份
+  （`find_ffmpeg()` 优先级：手动指定 > exe 内置 > PATH）。
   机器上没装 ffmpeg 也能打，只是打出来的 exe 录不了，得自己装。
 - 不想打进去用 `--no-ffmpeg`；想连 ffprobe 一起打用 `--with-ffprobe`（多 80MB 左右）。
-
-打包要求解释器**带 tkinter** —— 托管 Python 3.13 没有，所以脚本会在候选里自动挑一个
-「tkinter / PyInstaller / bilibili_api 都齐」的（也可以用 `--python` 指定）。
-
-打完后脚本会跑一遍 **exe 自检**（`RecorderUploader.exe --selftest`），把依赖、
-bilibili_api 的接口配置、HTTP 请求客户端都验一遍，还会**真的执行一次内置的
-`ffmpeg -version`** —— 光看「窗口能不能开」验证不了投稿和录制那两半。
+- 打包要求解释器**带 tkinter** —— 托管 Python 3.13 没有，脚本会自动挑一个
+  「tkinter / PyInstaller / bilibili_api 都齐」的（也可以用 `--python` 指定）。
+- 打完后会跑一遍 **exe 自检**（`RecorderUploader.exe --selftest`）：依赖、
+  bilibili_api 的接口配置、HTTP 请求客户端、cookie 名映射，
+  还会**真的执行一次内置的 `ffmpeg -version`** —— 光看「窗口能不能开」验证不了录制和投稿那两半。
 
 ---
 
@@ -158,18 +184,20 @@ recordings/
 python record.py --bili-login
 ```
 
-登录态存到 `bili_credential.json`，之后一直复用。
-**没登录就不会投稿**（跳过并提示，不影响录制）。
-界面右上角会显示实测出来的登录状态（`正常 · 昵称` / `已失效，点右边「B 站扫码登录」重登`）；
-上传前还会再用 `nav` 接口实测一次 —— 见下面「不管合集」里那段说明。
+登录态存到 `bili_credential.json`，之后一直复用。**没登录就不会投稿**（跳过并提示，不影响录制）。
+
+> **上传前一定实测一次登录态。** 只检查「字段在不在」是不够的：cookie 过期时字段一个不少、
+> 看着完全正常，等你传完几 GB 才在最后一步炸。所以投稿前会打一次 `nav` 接口，
+> 失效就当场停下、把这一段记成「待补传」，重新登录后点「补传」即可 ——
+> 不会白传一场，也不会把段丢掉。
 
 ### 分段录完就上传（不等直播结束）
 
-一段录完的**当下**就交给后台上传队列，录制立刻接着录下一段 —— 不用等整场结束。
-上传是**后台串行**的：谁的段先录完谁先传，不会阻塞任何一路录制。
+一段录完的**当下**就交给后台上传队列，录制立刻接着录下一段。
+后台队列是**串行**的：谁的段先录完谁先传。
 
 这一点很关键：投稿失败要退避重试、还要防风控节流，如果卡在录制线程里同步做，
-等于把录制挂起 7 分钟。后台化之后完全不受影响。
+等于把录制挂起好几分钟。后台化之后完全不受影响。
 
 ### 每 2 小时切一段，每段投成独立稿件
 
@@ -196,6 +224,18 @@ python record.py --bili-login
 > ⚠️ **别把 `{time}` 去掉**。B 站不接受短时间内重复标题，同一天的多段只写 `{date}`
 > 会被拒（报「短时间内标题不能相同」）。
 
+### 投稿失败可以补传
+
+投稿失败（比如 406 风控）的段会记到 exe 同目录的 `bili_failed_uploads.json`
+（含原始文件路径、段开始时间、失败原因），两种方式补：
+
+- 界面上点「**补传**」
+- 命令行 `python record.py --bili-retry`
+
+补传走同一条后台队列，**按原参数**重投；成功自动从清单划掉，文件不在本地会跳过。
+节流（防 406）和进度显示照常生效。点「补传」时会**重新实测登录态** ——
+你如果是刚登录完来点补传，不会因为上次的结论被挡在外面。
+
 ### 不管合集
 
 投稿只管把视频投上去，**不自动归到合集**。要归档到合集，事后跑 `bili_season.py`：
@@ -204,22 +244,14 @@ python record.py --bili-login
 python bili_season.py add --season 合集名 --latest     # 把最新稿件放进指定合集
 ```
 
-- **投稿本身失败（比如 406 风控）有兜底**：失败的段会记到 exe 同目录的
-  `bili_failed_uploads.json`（含原始文件路径、开始时间和失败原因），点界面上的
-  「**补传**」或 `python record.py --bili-retry` 就按原参数重投；成功自动划掉，
-  文件不在本地会跳过。节流（防 406）和进度显示在补传时照常生效。
-- **上传前会实测一次 B 站登录态**（打 `nav` 接口，字段齐全 ≠ cookie 还有效）。
-  失效时不会白传一场：当场的段直接记成「待补传」，重新登录后点「补传」即可。
-  界面右上角会显示登录状态（正常 · 昵称 / 已失效）。
-
 ### 封面统一取第一帧
 
-`cover_position = 0` 就是**视频第一帧**（默认）。想换画面填秒数即可。
+`cover_position = 0` 就是**视频第一帧**（默认），想换画面填秒数即可。
 B 站要求封面必填且不接受空字符串，所以这帧是必须抽的；ffmpeg 抽不出来会退回 opencv。
 
 ### TS 直接上传
 
-`container = 'ts'`（默认）：录好的 `.ts` 直接投给 B 站，**由 B 站云端转码**，本地不做任何处理。
+`container = 'ts'`（默认）：录好的 `.ts` 直接投给 B 站，**由 B 站云端转码**，本地不做处理。
 想先在本地无损转封装成 MP4 再传，就设 `container = 'mp4'`（`ffmpeg -c copy`，同样不重编码）。
 
 ### 命令行开关
@@ -231,6 +263,7 @@ B 站要求封面必填且不接受空字符串，所以这帧是必须抽的；
 | `--bili` | 本次强制投稿（配置里 `enabled = false` 时也能压过） |
 | `--bili-config PATH` | 用别的配置文件 |
 | `--bili-login` | 只做扫码登录，设置完就退出 |
+| `--bili-retry` | 只补传投稿失败的段，然后退出（不录制） |
 
 ---
 
@@ -240,18 +273,19 @@ B 站要求封面必填且不接受空字符串，所以这帧是必须抽的；
 |---|---|
 | `record_gui.py` | 图形界面（tkinter） |
 | `build_record_exe.py` / `.bat` | 把界面打包成单文件 exe |
-| `record.py` | 录制 + 投稿的核心逻辑：`run_recording()`（单个主播，界面和命令行共用）、
-              `UploadWorker`（后台上传队列）、`record_rooms()`（多主播并发） |
+| `record.py` | 录制 + 投稿的核心逻辑：`run_recording()`（单个主播，界面和命令行共用）、`UploadWorker`（后台上传队列）、`record_rooms()`（多主播并发） |
 | `record.bat` | 命令行双击入口 |
 | `douyin_api.py` | 查开播状态 / 房间信息 / 拉流地址；`parse_rid` 解析房间号 |
 | `cookie_store.py` | `cookie.txt` 的读写（整串 / 多行 / JSON / `#` 注释都认） |
-| `bili_uploader.py` | 投稿：扫码登录（含 cookie 实测）/ 首帧封面 / TS 直传 / 多分P / 投稿出问题可补传 |
-| `bili.toml` | 投稿配置（标题/简介模板、分区、标签、节流间隔） |
-| `vendor/ab_sign.py` | 纯 Python 的 a_bogus 签名实现（见文末许可） |
+| `bili_uploader.py` | 投稿：扫码登录（含 cookie 实测）/ 首帧封面 / TS 直传 / 多分P / 失败可补传 |
+| `bili.toml` | 投稿配置（标题简介模板、分区、标签、节流间隔） |
+| `vendor/ab_sign.py` | 纯 Python 的 a_bogus 签名实现（MIT，见第六节） |
+| `vendor/ffmpeg/` | ffmpeg 的 GPLv3 许可原文与构建说明（见第六节） |
 | `recordings/` | 录制输出目录（**不进仓库**） |
 | `cookie.txt` | 抖音 Cookie，自己填（**不进仓库**） |
 | `bili_credential.json` | B 站登录态（**不进仓库**） |
-| `record_gui.json` | 界面记住的设置（**不进仓库**） |
+| `record_gui.json` / `logs/` | 界面设置与日志（**不进仓库**） |
+| `bili_failed_uploads.json` | 投稿失败待补传的清单（**不进仓库**） |
 
 ### 关于 cookie.txt
 
@@ -266,25 +300,71 @@ B 站要求封面必填且不接受空字符串，所以这帧是必须抽的；
 ## 五、注意
 
 - **合规**：本工具仅用于学习研究，请遵守抖音与哔哩哔哩的用户协议。
-  别用单 IP 高频狂连，并发房间数建议控制在个位数。
+  别用单 IP 高频狂连，并发房间数建议控制在个位数。录播内容的版权归主播 / 平台，
+  公开传播前请自行确认授权。
 - 抖音偶发风控时可能查不到房间信息；「一直等」模式会每 30 秒自动重试，不用管。
 - **投稿报 406 是 B 站的风控**（短时间投稿过多触发，HTTP 406），不是程序坏了：
   浏览器打开 member.bilibili.com/platform/upload/video/frame 手动投一个、过一次
   人机验证即可解除；风控有第二阶段，触发了大约 1 小时自动解除。
-  `bili.toml` 里的 `[bili] min_interval` 可以设两次投稿的最小间隔
+  `bili.toml` 里的 `bili.min_interval` 可以设两次投稿的最小间隔
   （多主播同时录、或分段很短时建议设 300 秒），就是为了少触发这个。
 - 稿件提交到 B 站后要过审核才公开。
 - 小于 `min_size_mb`（默认 1MB）的片段会被跳过，避免把空文件传上去。
-- 某一段投稿失败不影响其它段，日志里会指出是哪一段。
+- 某一段投稿失败不影响其它段，日志里会指出是哪一段，之后可以「补传」。
 
 ---
 
-## 六、第三方代码与许可
+## 六、第三方组件与许可
 
-- `vendor/ab_sign.py` —— a_bogus 的纯 Python 实现，来自
-  [ihmily/DouyinLiveRecorder](https://github.com/ihmily/DouyinLiveRecorder)，**MIT**，
-  许可证原文见 `vendor/LICENSE-ab_sign.txt`。
+### 本仓库自己的代码
 
-本仓库只包含录制所需的部分，所以没有引入其他第三方签名脚本 / protobuf 定义。
-若你要在本项目里重新加入弹幕相关代码，注意那些来源的许可（例如
-[saermart/DouyinLiveWebFetcher](https://github.com/saermart/DouyinLiveWebFetcher) 是 **AGPL-3.0**）。
+**MIT**，见 [LICENSE](LICENSE)。
+
+> ⚠️ 但**发布出去的成品并不只有 MIT 代码** —— 下面的组件里有两个是 GPL，
+> 打包进 exe 之后整个发布物得按 GPL 走。详见「GPL 组件带来的义务」。
+
+### 直接依赖
+
+| 组件 | 版本 | 许可 | 用途 | 在 exe 里 |
+|---|---|---|---|---|
+| [FFmpeg](https://ffmpeg.org/) `essentials_build`（[gyan.dev](https://www.gyan.dev/ffmpeg/builds/)） | 7.1.1 | **GPL v3** | 录制封装 TS、抽封面帧、可选转 MP4 | ✅ 静态版，约 83MB |
+| [bilibili-api-python](https://github.com/Nemo2011/bilibili-api) | 17.4.2 | **GPL-3.0-or-later** | B 站投稿（`VideoUploader`） | ✅ |
+| [requests](https://github.com/psf/requests) | 2.34 | Apache-2.0 | 抖音接口、登录、登录态检测 | ✅ |
+| [curl_cffi](https://github.com/lexiforest/curl_cffi) | 0.16.3 | MIT | `bilibili-api` 的 HTTP 客户端 | ✅（内含 `libcurl-impersonate`，MIT） |
+| [qrcode-terminal](https://pypi.org/project/qrcode-terminal/) | 0.8 | MIT | 终端扫码登录 | ✅ |
+| [qrcode](https://github.com/lincolnloop/python-qrcode) | 8.2 | BSD | 界面里把二维码画成图 | ✅ |
+| [Pillow](https://python-pillow.org/) | 12.3 | MIT-CMU（PIL 许可） | 二维码渲染 | ✅ |
+| [pycryptodomex](https://github.com/Legrandin/pycryptodome) | 3.23 | BSD / Public Domain | `bilibili-api` 依赖 | ✅ |
+| [beautifulsoup4](https://www.crummy.com/software/BeautifulSoup/) / [lxml](https://lxml.de/) | 4.15 / 6.1 | MIT / BSD-3-Clause | `bilibili-api` 依赖 | ✅ |
+| [websocket-client](https://github.com/websocket-client/websocket-client) | 1.7 | Apache-2.0 | `bilibili-api` 依赖 | ✅ |
+| [yarl](https://github.com/aio-libs/yarl) / [multidict](https://github.com/aio-libs/multidict) | 1.25 / 6.9 | Apache-2.0 | `bilibili-api` 依赖 | ✅ |
+| [certifi](https://github.com/certifi/python-certifi) | 2026.7 | MPL-2.0 | CA 证书 | ✅ |
+| [urllib3](https://github.com/urllib3/urllib3) / [idna](https://github.com/kjd/idna) / [charset-normalizer](https://github.com/jawah/charset_normalizer) | 2.8 / 3.20 / 3.5 | MIT / BSD-3-Clause / MIT | 传递依赖 | ✅ |
+| [python-dateutil](https://github.com/dateutil/dateutil) | 2.9 | BSD-3-Clause / Apache-2.0 双许可 | 传递依赖 | ✅ |
+| [betterproto](https://github.com/danielgtaylor/python-betterproto) | 2.0.0b6 | MIT | `bilibili-api` 依赖 | ✅ |
+| [PyInstaller](https://pyinstaller.org/) | 6.22 | GPLv2 **+ bootloader 例外** | 打包成单文件 exe | 只用了引导程序 |
+
+### 源码引入的第三方代码
+
+| 文件 | 来源 | 许可 |
+|---|---|---|
+| `vendor/ab_sign.py` | [ihmily/DouyinLiveRecorder](https://github.com/ihmily/DouyinLiveRecorder) | **MIT**，原文见 `vendor/LICENSE-ab_sign.txt` |
+
+本仓库只保留录制所需的部分：**没有**引入弹幕相关的签名脚本和 protobuf 定义
+（那些来源里有 AGPL-3.0，例如
+[saermart/DouyinLiveWebFetcher](https://github.com/saermart/DouyinLiveWebFetcher)）。
+你要自己加回来时，注意它们各自的许可。
+
+### GPL 组件带来的义务
+
+`bilibili-api-python` 是 **GPL-3.0-or-later**；ffmpeg 这份构建是 **GPL v3**
+（`--enable-gpl --enable-version3`，见 `vendor/ffmpeg/BUILD-README.txt`）。
+两者都被打包进了 exe，所以 **release 里的 `RecorderUploader.exe` 整体按 GPL 分发**：
+
+- **附许可原文**：本仓库 `LICENSE`（MIT）、`vendor/ffmpeg/LICENSE-GPLv3.txt`（GPLv3 全文）、
+  `vendor/LICENSE-ab_sign.txt`（MIT）；release 页面也单独附了 GPLv3 全文。
+- **提供源码**：本仓库就是全部源码；ffmpeg 的源码对应
+  `https://github.com/FFmpeg/FFmpeg/commit/db69d06eee`（gyan.dev 构建说明里给的那个 commit）。
+- 要**二次分发**（打包进自己的产品、放到别的下载站），请一并带上上面这些许可原文和源码链接。
+- 只在本地自己用 / 学习，不受这些约束 —— 上面讲的是**分发**时的要求。
+
