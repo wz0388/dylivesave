@@ -29,17 +29,11 @@ cover_position = 0             # 封面取第几秒的画面；0 = 视频第一�
 container = 'ts'               # ts = 直接传（B 站云端转码，推荐）；mp4 = 先无损转封装再传
 keep_mp4 = true                # container=mp4 时，转出来的 mp4 是否保留（原 ts 始终保留）
 min_size_mb = 1                # 小于这个体积的片段不投稿，防止把空文件传上去
+# 两次投稿之间的最小间隔（秒），0 = 不限。
+# B 站有「上传过快」风控：短时间连投会被 406 拦下（要去网页端过一次人机验证才解除）。
+# 多个主播同时录、或者用很短的分段测试时，建议设 300。
+min_interval = 0
 
-[season]
-# ── 每个主播一个合集 ──
-enabled = true
-# 合集名模板：{anchor} 替换成主播昵称。
-#   想要「主播各自一个合集」就保留 "{anchor}"；
-#   想让所有主播都进同一个合集，就写成固定名字，例如 '直播回放'
-name_template = "{anchor}"
-create_if_missing = true       # 合集不存在就自动新建（新建要传封面，B站有人工审核）
-desc_template = "{anchor} 的直播回放合集"
-
-# 单独给某些主播指定合集名（优先级高于上面的模板），按需打开注释改
-[season.anchors]
-# "黄同学书屋" = "黄同学书屋的直播回放"
+# 合集不在这里配 —— 投稿只管投上去，不归合集。
+# 要归档到合集，用 09-15 工作区里的 bili_season.py：
+#   python bili_season.py add --season 合集名 --latest

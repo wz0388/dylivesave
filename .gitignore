@@ -1,0 +1,36 @@
+# ═══ 凭证：绝对不能提交 ═══
+# 抖音 Cookie（拉流接口会带上，降低被风控的概率）
+cookie.txt
+# B 站登录态（界面里的「B 站扫码登录」或 python record.py --bili-login 生成）
+bili_credential.json
+
+# ═══ 录制产物 / 日志 / 界面设置 ═══
+recordings/
+logs/
+*.ts
+*.mp4
+*.flv
+record_gui.json
+# 「投稿失败」的待补传清单（点「补传」或 --bili-retry 重投）
+bili_failed_uploads.json
+
+# ═══ 打包产物 ═══
+*.exe
+build/
+dist/
+*.spec
+
+# ═══ Python ═══
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.env
+
+# ═══ 编辑器 / 系统 ═══
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

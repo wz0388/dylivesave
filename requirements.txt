@@ -1,6 +1,10 @@
 requests>=2.31.0
 
-# 录完自动投稿到 B 站（bili_uploader.py
-# 注意包名带 -python 后缀；装成 bilibili_api 会拿到 2021 年的旧包，Python 3.12 上编译不过
+# 录完自动投稿到 B 站用（bili_uploader.py）。
+# 注意包名带 -python 后缀：装成 bilibili_api 会拿到 2021 年的旧包，Python 3.12 上编译不过。
 bilibili-api-python>=17.0.0
 qrcode-terminal>=0.8
+# bilibili-api-python 自己**不带 HTTP 客户端**，必须再装一个，否则一投稿就报
+# 「尚未安装第三方请求库」。curl_cffi 是它优先选的那个，也更不容易被风控；
+# 装 httpx 或 aiohttp 也可以。
+curl_cffi>=0.7.0
