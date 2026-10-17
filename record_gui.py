@@ -10,6 +10,7 @@
     日志前面带 `[房间号]` 前缀，分得清是谁的。
   · **分段一录完就上传**：交给后台上传队列，录制线程立刻接着录下一段 ——
     不会因为上传（投稿失败要退避重试）把录制卡住。
+    同一场直播的各段追加成**同一个视频的 P1/P2/P3…**，关播再开播才另起一个视频。
   · 未开播时按设定每 30 秒重试一次拉流（默认一直等，直到开播或点停止）。
   · 录完自动投稿是否开启，界面里能改（配置见 bili.toml；不管合集）。
 """
@@ -42,10 +43,31 @@ SETTINGS = APP_DIR / "record_gui.json"
 QUALITY_CHOICES = ["FULL_HD1", "ORIGIN", "HD1", "SD1", "SD2", "LD", "auto"]
 QUALITY_LABEL = {"FULL_HD1": "原画/高清（推荐）", "ORIGIN": "原画", "HD1": "高清",
                  "SD1": "标清", "SD2": "较低", "LD": "流畅", "auto": "自动挑最好的"}
-SEGMENT_CHOICES = [("2 小时（推荐）", 7200), ("1 小时", 3600), ("3 小时", 10800),
-                   ("6 小时", 21600), ("不分段", 0)]
+SEGMENT_CHOICES = [("30 分钟", 1800), ("60 分钟", 3600),
+                   ("120 分钟（推荐）", 7200), ("不分段", 0)]
+#: 默认分段时间（2 小时，和命令行 --segment 7200 一致）
+SEGMENT_DEFAULT = SEGMENT_CHOICES[2][0]
+#: 老版本界面存下来的标签 → 秒数（换过选项文案，读旧设置时要翻译一下）
+_SEGMENT_LEGACY = {"2 小时（推荐）": 7200, "1 小时": 3600, "3 小时": 10800,
+                   "6 小时": 21600, "不分段": 0}
 DURATION_CHOICES = [("一直录到手动停止", 0), ("30 分钟", 1800), ("1 小时", 3600),
                     ("2 小时", 7200), ("6 小时", 21600)]
+
+
+def _segment_label(saved: str = "") -> str:
+    """把设置里存的「分段时间」翻译成当前选项的文案。
+
+    选项改过（以前是 1/2/3/6 小时），老配置里的 "2 小时（推荐）" 现在不在列表里，
+    直接塞进只读下拉框会显示不出东西 —— 这里按秒数对回去，对不上就用默认值。
+    """
+    labels = [s[0] for s in SEGMENT_CHOICES]
+    if saved in labels:
+        return saved
+    sec = _SEGMENT_LEGACY.get(saved or "")
+    for label, s in SEGMENT_CHOICES:
+        if s == sec:
+            return label
+    return SEGMENT_DEFAULT
 
 
 def open_in_explorer(path: Path) -> None:
@@ -126,8 +148,8 @@ class RecorderApp:
         top.columnconfigure(1, weight=1)
         top.columnconfigure(3, weight=1)
 
-        ttk.Label(top, text="分段时间").grid(row=0, column=0, sticky="e", **pad)
-        self.var_segment = tk.StringVar(value=SEGMENT_CHOICES[0][0])
+        ttk.Label(top, text="分段时间（默认）").grid(row=0, column=0, sticky="e", **pad)
+        self.var_segment = tk.StringVar(value=SEGMENT_DEFAULT)
         ttk.Combobox(top, textvariable=self.var_segment, state="readonly",
                      values=[s[0] for s in SEGMENT_CHOICES]).grid(row=0, column=1,
                                                                  sticky="ew", **pad)
@@ -169,17 +191,31 @@ class RecorderApp:
         # ---- 投稿
         bili_box = ttk.LabelFrame(self.root, text="B 站投稿")
         bili_box.pack(fill="x", padx=10, pady=6)
+
+        row1 = ttk.Frame(bili_box)
+        row1.pack(fill="x")
         self.var_upload = tk.BooleanVar(value=True)
-        ttk.Checkbutton(bili_box, text="分段录完就自动投稿",
+        ttk.Checkbutton(row1, text="分段录完就自动投稿（同一场直播投成一个视频的分P）",
                         variable=self.var_upload).pack(side="left", padx=8, pady=4)
-        self.lbl_login = ttk.Label(bili_box, text="登录状态：未检查", foreground="#666")
+        self.lbl_login = ttk.Label(row1, text="登录状态：未检查", foreground="#666")
         self.lbl_login.pack(side="left", padx=(16, 8))
-        ttk.Button(bili_box, text="B 站扫码登录", command=self.open_login).pack(
+        ttk.Button(row1, text="B 站扫码登录", command=self.open_login).pack(
             side="right", padx=8, pady=4)
-        ttk.Button(bili_box, text="编辑配置", command=self.edit_bili_config).pack(
+        ttk.Button(row1, text="编辑配置", command=self.edit_bili_config).pack(
             side="right", pady=4)
-        ttk.Button(bili_box, text="补传", command=self.fix_uploads).pack(
+        ttk.Button(row1, text="补传", command=self.fix_uploads).pack(
             side="right", padx=8, pady=4)
+
+        row2 = ttk.Frame(bili_box)
+        row2.pack(fill="x")
+        # 开关写在 bili.toml 的 [bili].delete_after_upload（GUI 和命令行共用同一份配置）
+        self.var_delete = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row2, text="上传成功后删除本地视频（省硬盘，删了找不回来）",
+                        variable=self.var_delete,
+                        command=self.on_toggle_delete).pack(side="left", padx=8,
+                                                            pady=(0, 4))
+        ttk.Label(row2, text="只删确认上传成功的那几个文件；没传上去的会留着补传",
+                  foreground="#666").pack(side="left", padx=(6, 8), pady=(0, 4))
 
         # ---- 操作区
         bar = ttk.Frame(self.root)
@@ -218,7 +254,7 @@ class RecorderApp:
         top.pack(fill="x", padx=4, pady=(4, 2))
         cols = ("seg", "anchor", "state", "pct")
         self.up_tree = ttk.Treeview(top, columns=cols, show="headings", height=6)
-        for c, w, t in (("seg", 60, "段"), ("anchor", 180, "主播"),
+        for c, w, t in (("seg", 90, "段 / 分P"), ("anchor", 180, "主播"),
                         ("state", 190, "状态"), ("pct", 150, "进度")):
             self.up_tree.heading(c, text=t)
             self.up_tree.column(c, width=w, anchor="center")
@@ -239,10 +275,11 @@ class RecorderApp:
             self.up_txt.tag_configure(t, foreground=c)
 
         self._load_failed_rows()
+        self._load_delete_setting()
         self._check_login()
 
     # ─────────────────── 主播行 ───────────────────
-    def add_row(self, room: str = "", quality: str = "") -> dict:
+    def add_row(self, room: str = "", quality: str = "", segment: str = "") -> dict:
         idx = len(self.rows) + 1
         f = ttk.Frame(self.rows_frame)
         f.pack(fill="x", pady=2)
@@ -259,7 +296,15 @@ class RecorderApp:
                           values=[f"{q}  {QUALITY_LABEL[q]}" for q in QUALITY_CHOICES])
         cb.pack(side="left", padx=(0, 6))
 
+        # 每个主播自己的分段时间（主界面「公共设置」里那个只作为新行的默认值）
+        var_s = tk.StringVar(value=_segment_label(segment) if segment
+                             else self.var_segment.get())
+        scb = ttk.Combobox(f, textvariable=var_s, state="readonly", width=13,
+                           values=[s[0] for s in SEGMENT_CHOICES])
+        scb.pack(side="left", padx=(0, 6))
+
         row = {"frame": f, "no": lbl_no, "room": var_room, "quality": var_q,
+               "segment": var_s, "seg_combo": scb,
                "entry": e, "combo": cb, "thread": None, "stop": None,
                "running": False, "rid": "", "_tag": ""}
 
@@ -308,11 +353,12 @@ class RecorderApp:
         rooms = d.get("rooms") or []
         if not rooms and d.get("room"):                 # 兼容只有单个房间的旧设置
             rooms = [{"room": d.get("room", ""), "quality": d.get("quality", "")}]
+        # 先恢复「默认分段时间」：add_row 建行时拿它当兜底
+        self.var_segment.set(_segment_label(d.get("segment", SEGMENT_DEFAULT)))
         for r in rooms or [{}]:
-            self.add_row(r.get("room", ""), r.get("quality", ""))
+            self.add_row(r.get("room", ""), r.get("quality", ""), r.get("segment", ""))
         if not self.rows:
             self.add_row()
-        self.var_segment.set(d.get("segment", SEGMENT_CHOICES[0][0]))
         self.var_duration.set(d.get("duration", DURATION_CHOICES[0][0]))
         self.var_dir.set(d.get("out_dir", str(rec.DEFAULT_DIR)))
         self.var_wait_mode.set(d.get("wait_mode", "forever"))
@@ -323,7 +369,9 @@ class RecorderApp:
     def _save_settings(self) -> None:
         try:
             SETTINGS.write_text(json.dumps({
-                "rooms": [{"room": r["room"].get().strip(), "quality": r["quality"].get()}
+                "rooms": [{"room": r["room"].get().strip(),
+                           "quality": r["quality"].get(),
+                           "segment": r["segment"].get()}
                           for r in self.rows],
                 "segment": self.var_segment.get(),
                 "duration": self.var_duration.get(),
@@ -343,9 +391,11 @@ class RecorderApp:
                 return q
         return QUALITY_CHOICES[0]
 
-    def _segment_seconds(self) -> int:
-        for label, sec in SEGMENT_CHOICES:
-            if label == self.var_segment.get():
+    def _segment_seconds(self, text: str = "") -> int:
+        """下拉框文案 → 秒数。text 传空就取主界面那个默认值。"""
+        label = text or self.var_segment.get()
+        for l, sec in SEGMENT_CHOICES:
+            if l == label:
                 return sec
         return 7200
 
@@ -367,14 +417,43 @@ class RecorderApp:
         return 0                       # 一直等
 
     # ─────────────────── 日志 / 状态 ───────────────────
-    def append_log(self, text: str) -> None:
+    def _log_from_thread(self, *a, live: str = "") -> None:
+        """录制线程把日志丢进队列，主线程再写控件（Tk 不能跨线程碰）。
+
+        live 非空表示这是进度型日志（「已写 …」），控制台里只留最新一条；
+        它只是捎带过去，`append_log` 负责替换，`file_log` 照旧全量落盘。
+        """
+        self.q.put(("log", (" ".join(map(str, a)), live)))
+
+    def append_log(self, text: str, live: str = "") -> None:
+        """写一行到「录制日志」。
+
+        live 非空 = 这是**进度型**日志（「已写 3.20 GB，已录 01:23:45」这类）：
+        同一个 key 在控制台只留最新一条 —— 先删掉旧的那行，再把新的接在末尾，
+        免得一个直播间每 15 秒堆一行把日志刷没。
+        文件日志（logs/gui.log）照旧全部追加，事后能查完整轨迹（含等待开播的日志）。
+        """
         tag = ""
         if text.startswith("[!]") or "[x]" in text or "失败" in text:
             tag = "warn"
         elif text.startswith("[√]"):
             tag = "ok"
         self.txt.configure(state="normal")
-        self.txt.insert("end", f"[{time.strftime('%H:%M:%S')}] {text}\n", tag)
+        if live:
+            try:
+                old = self.txt.tag_ranges(f"live:{live}")
+                if old:
+                    self.txt.delete(old[0], old[1])     # 删掉过期的这一条
+            except Exception:
+                pass
+        start = self.txt.index("end-1c")
+        line = f"[{time.strftime('%H:%M:%S')}] {text}\n"
+        self.txt.insert("end", line, tag)
+        if live:
+            try:                                        # 给新的一行打上同一个 key
+                self.txt.tag_add(f"live:{live}", start, f"{start}+{len(line)}c")
+            except Exception:
+                pass
         self.txt.see("end")
         self.txt.configure(state="disabled")
         file_log(text)
@@ -420,30 +499,37 @@ class RecorderApp:
             err = (it.get("error") or "失败原因未知").strip()
             if len(err) > 40:
                 err = err[:40] + "…"
-            self._up_row(f"old{i}", it.get("seq", "?"), it.get("anchor") or "",
+            label = f"#{it.get('seq', '?')}"
+            if it.get("part"):
+                label += f" P{it['part']}"
+            self._up_row(f"old{i}", label, it.get("anchor") or "",
                          f"待补传（{err}）", "—")
 
-    def _on_upload_event(self, seq, phase, pct, anchor, done=0, total=0) -> None:
+    def _on_upload_event(self, seq, phase, pct, anchor, done=0, total=0,
+                         label="") -> None:
         """上传事件 → 表格行。
 
         ⚠️ 只显示百分比是不够的：B 站固定 10MB 一块，2GB 的文件有 205 块，
         每块才 0.49% —— 前几十兆算出来一直是 0%，看着像卡住。
         所以连着块数一起显示（「0%（2/205 块）」），从第一块就看得出在动。
+
+        label 是「段 / 分P」那一列的文字：`#3 P2` = 第 3 段、这场直播的第 2 个分P。
         """
         iid = f"seq{seq}"
+        seg = label or f"#{seq}"
         if phase == "start":
-            self._up_row(iid, seq, anchor, "上传中", "0%")
+            self._up_row(iid, seg, anchor, "上传中", "0%")
             self._up_pct, self._up_chunks = 0, ""
         elif phase == "progress":
             cell = f"{pct}%（{done}/{total} 块）" if total else f"{pct}%"
-            self._up_row(iid, seq, anchor, "上传中", cell)
+            self._up_row(iid, seg, anchor, "上传中", cell)
             self._up_pct = pct
             self._up_chunks = f"{done}/{total}" if total else ""
         elif phase == "ok":
-            self._up_row(iid, seq, anchor, "✓ 已投稿", "100%")
+            self._up_row(iid, seg, anchor, "✓ 已投稿", "100%")
             self._up_pct, self._up_chunks = 100, ""
         elif phase == "fail":
-            self._up_row(iid, seq, anchor, "✗ 失败（可补传）", "—")
+            self._up_row(iid, seg, anchor, "✗ 失败（可补传）", "—")
             self._up_chunks = ""
         self._refresh_status()
 
@@ -480,8 +566,12 @@ class RecorderApp:
             while True:
                 kind, payload = self.q.get_nowait()
                 if kind == "log":
-                    self.append_log(payload)
-                    self._status_from_log(payload)
+                    if isinstance(payload, tuple):
+                        text, live = payload
+                    else:                      # 老格式：直接是字符串
+                        text, live = payload, ""
+                    self.append_log(text, live)
+                    self._status_from_log(text)
                 elif kind == "uplog":
                     self.up_log(payload)
                 elif kind == "login":
@@ -571,6 +661,7 @@ class RecorderApp:
             run = bool(r.get("running"))
             r["entry"].configure(state="disabled" if run else "normal")
             r["combo"].configure(state="disabled" if run else "readonly")
+            r["seg_combo"].configure(state="disabled" if run else "readonly")
             r["btn_start"].configure(state="disabled" if run else "normal")
             r["btn_stop"].configure(state="normal" if run else "disabled")
 
@@ -580,8 +671,10 @@ class RecorderApp:
             self.uploader = rec.UploadWorker(
                 # 上传的日志进「上传」分页，和录制日志分开
                 log=lambda *a: self.q.put(("uplog", " ".join(map(str, a)))),
-                progress=lambda seq, phase, pct, anchor="", done=0, total=0:
-                    self.q.put(("progress", (seq, phase, pct, anchor, done, total))))
+                progress=lambda seq, phase, pct, anchor="", done=0, total=0,
+                                label="":
+                    self.q.put(("progress",
+                                (seq, phase, pct, anchor, done, total, label))))
         # 每次开录都按当前开关刷新一次（用户可能中途改主意）
         self.uploader.no_bili = not self.var_upload.get()
         return self.uploader
@@ -618,10 +711,11 @@ class RecorderApp:
             target=rec.run_one_room, name=f"rec-{rid}", daemon=True,
             kwargs=dict(
                 rid=rid, tag=tag,
-                logf=lambda *a: self.q.put(("log", " ".join(map(str, a)))),
+                logf=self._log_from_thread,
                 uploader=self._ensure_uploader(), stop_event=row["stop"],
                 quality=self._quality_code(row["quality"].get()),
-                segment=self._segment_seconds(), duration=self._duration_seconds(),
+                segment=self._segment_seconds(row["segment"].get()),
+                duration=self._duration_seconds(),
                 out_dir=str(out_dir), wait=self._wait_seconds(), upload=True,
                 monitor=self.var_monitor.get()))
         row["monitor"] = self.var_monitor.get()
@@ -718,6 +812,35 @@ class RecorderApp:
 
     def edit_bili_config(self) -> None:
         open_in_explorer(bu.DEFAULT_CONFIG)
+
+    # ─────────────────── 上传成功后删本地视频 ───────────────────
+    def _load_delete_setting(self) -> None:
+        """勾选框跟着 bili.toml 走（GUI 和命令行共用同一份配置）。"""
+        try:
+            cfg, _ = bu.load_config()
+            self.var_delete.set(bool(getattr(cfg, "delete_after_upload", False)))
+        except Exception:
+            self.var_delete.set(False)
+
+    def on_toggle_delete(self) -> None:
+        """勾/取消勾 → 立刻写回 bili.toml，并让后台上传队列下次重新读配置。"""
+        want = bool(self.var_delete.get())
+        try:
+            path = bu.set_config_value("delete_after_upload",
+                                       "true" if want else "false")
+        except Exception as e:
+            self.var_delete.set(not want)          # 写不进去就把勾选框退回去
+            messagebox.showerror("改不了配置", f"写 {bu.DEFAULT_CONFIG.name} 失败：{e}")
+            return
+        if self.uploader is not None:
+            self.uploader.reload_cfg()             # 正在跑的队列也换成新值
+        if want:
+            self.append_log("[i] 已开启「上传成功后删除本地视频」"
+                            f"（{Path(path).name} 里 delete_after_upload = true）")
+            self.append_log("    ⚠️ 只删确认投稿成功的那几个文件，删了找不回来；"
+                            "要留本地档就别开")
+        else:
+            self.append_log("[i] 已关闭「上传成功后删除本地视频」，录好的文件都会留着")
 
     def fix_uploads(self) -> None:
         """补传：把投稿失败的稿件重新投一遍（跨重启也在，406 风控解除后用它）。
@@ -933,10 +1056,16 @@ def selftest() -> int:
     def check_ffmpeg():
         """不只确认「找得到」，还要真的跑一次 —— 内置的 ffmpeg 万一提取坏了
         也应该在这里暴露，而不是等到录制时才发现。"""
+        import shutil
         import subprocess
         p = rec.find_ffmpeg()
         if not Path(p).is_file():
-            raise RuntimeError(f"找不到 ffmpeg（{p}）—— 打包时应该把它打进 exe")
+            # 源码运行时 find_ffmpeg 返回的是裸命令名 "ffmpeg"，按 PATH 解析；
+            # 打包后它返回 _MEIPASS 里的绝对路径，上面就已命中。
+            p = shutil.which(p) or p
+        if not Path(p).is_file():
+            raise RuntimeError(f"找不到 ffmpeg（{p}）—— 打包时应该把它打进 exe，"
+                               "源码运行则要装 ffmpeg 或 --ffmpeg 指定路径")
         r = subprocess.run([p, "-version"], capture_output=True, timeout=60)
         first = (r.stdout or b"").decode("utf-8", errors="replace").splitlines()[:1]
         if r.returncode != 0 or "ffmpeg" not in (first[0] if first else ""):

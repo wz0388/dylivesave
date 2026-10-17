@@ -6,7 +6,9 @@
   · 登录：复用 bili_credential.json，没有/坏了就扫码（record.py --bili-login）
   · 封面：默认取视频**第一帧**（cover_position = 0），可改成第 N 秒
   · TS → MP4：ffmpeg `-c copy` 无损转封装（不重编码，秒级），避免 B 站不认 TS 封装
-  · 多分P：断流重连产生的 `_part2.ts` 会作为 P2、P3… 一起投成一个稿件
+  · 多分P：**一场直播 = 一个稿件**。同一场直播按时间切出来的每一段（以及断流重连
+    产生的 `_part2.ts`）都是这个稿件的 P1/P2/P3…；关播再开播算新的一场，投成新稿件。
+    第一段用 archive/add 建稿，之后每段传完新文件再走 archive/edit 把分P列表补全。
 
 （不管合集：投稿只管投上去。要归档到合集，用 09-15 工作区里的 bili_season.py。）
 
@@ -28,7 +30,7 @@ import tempfile
 import time
 import tomllib
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
@@ -65,6 +67,10 @@ _POLL_DONE, _POLL_TIMEOUT, _POLL_CONF = 0, 86038, 86090
 MAX_UPLOAD_BYTES = 4 * 1024 ** 3          # B 站单文件上限
 MAX_DURATION_SEC = 5 * 3600               # B 站时长上限
 
+#: 分P 标题默认模板：这一段的「开始时间-结束时间」（20:00-22:00）。
+#: B 站播放器自己会在标题旁边标 P1/P2，所以模板里不用再写「第 N 段」。
+DEFAULT_PART_TITLE = "{time}-{end}"
+
 
 class BiliError(RuntimeError):
     """投稿流程里所有可预期的失败都抛这个，方便调用方统一兜住。"""
@@ -86,16 +92,32 @@ no_reprint = true              # true=禁止转载
 # 标题/简介模板，可用占位符：
 #   {anchor} 主播昵称   {title} 直播间标题   {date} 日期   {time} 时间
 #   {datetime} 日期时间   {quality} 清晰度   {room_id} 房间号
-#   {seg} 这是第几段   {segments} 总段数（「分片即传」时总段数未知，会填 0）
+#   {seg} 这是本次录制交出去的第几段   {segments} 总段数（「分段即传」时未知，填 0）
+#   {part} 这一段从第几个分P开始   {parts} 这一段包含几个分P
 #
-# 注意 {date}/{time}/{datetime} 取的是**这一段录制的开始时间**（不是投稿时间）——
-# 录播按 2 小时分段后，靠它区分同一天的多个稿件。
-# 一定要带上 {time}，否则同一天的多段标题会重复，B 站会拒（短时间内标题不能相同）。
+# 注意 {date}/{time}/{datetime} 取的是**这一场直播的开始时间**（不是投稿时间）。
+# 一场直播 = 一个稿件，关播再开播是另一场，靠时间区分同一天的多个稿件。
 title_template = "{anchor} 直播回放 {date} {time}"
-desc_template = """{anchor} 的直播回放（第 {seg} 段）
+desc_template = """{anchor} 的直播回放（第 {seg} 段，分P 从第 {part} 段起）
 直播间：https://live.douyin.com/{room_id}
 本段开始：{datetime}
 清晰度：{quality}"""
+
+# 一场直播投成一个稿件，同一场直播的各分片当这个稿件的 P1/P2/P3…
+# 关播再开播算新的一场，投成新稿件。设成 false 退回老行为：每段一个独立稿件。
+multi_part = true
+# 分P标题模板（播放器分P列表里显示的名字）。默认是「这一段的开始时间-结束时间」，
+# 因为 B 站自己会在旁边标 P1/P2，不用再写「第 N 段」。
+# 可用：{time} 开始时间  {end} 结束时间  {dur} 时长(00:00:00)  {start} 同 {time}
+#       {part} 第几个分P  {date}/{datetime}/{anchor}/{quality}/{room_id}
+# B 站分P标题上限 80 字。
+part_title_template = "{time}-{end}"
+
+# 投稿成功后删掉本地录制文件（默认关）。
+# 只删**这一批真正传上去、并且确认投稿成功**的文件；被 min_size_mb 跳过、
+# 超过 4GB 没传上去的都不动（它们还要留着补传）。
+# ⚠️ 删了就找不回来 —— 想留着本地留档就别开。
+delete_after_upload = false
 
 cover_position = 0             # 封面取第几秒的画面；0 = 视频第一帧
 container = 'ts'               # ts = 直接传（B 站云端转码，推荐）；mp4 = 先无损转封装再传
@@ -150,6 +172,9 @@ class BiliConfig:
     keep_mp4: bool = True
     min_size_mb: float = 1.0
     min_interval: int = 0
+    multi_part: bool = True
+    part_title_template: str = DEFAULT_PART_TITLE
+    delete_after_upload: bool = False
     base_dir: Path = APP_DIR
 
 
@@ -160,6 +185,50 @@ def write_config_template(path: Path = DEFAULT_CONFIG, force: bool = False) -> b
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(CONFIG_TEMPLATE, encoding="utf-8")
     return True
+
+
+def set_config_value(key: str, literal: str,
+                     path: Path | str | None = None) -> Path:
+    """改 bili.toml 里 [bili] 段的某个键，**保留其它行和注释**。
+
+    只替换 `key = 值` 里的值（行尾注释留着）；键不存在就插到 [bili] 段的第一行。
+    界面上的「上传成功后删除本地视频」勾选框用它把开关写回配置 ——
+    这样 GUI 和命令行读的是同一份配置，不会出现「界面勾了、命令行没勾」。
+    """
+    path = Path(path or DEFAULT_CONFIG)
+    if not path.is_file():
+        write_config_template(path)
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines(keepends=True)
+    if lines and not lines[-1].endswith(("\n", "\r")):
+        lines[-1] += "\n"
+
+    # 找 [bili] 段的范围
+    start = None
+    for i, ln in enumerate(lines):
+        if re.match(r"^\s*\[bili\]\s*(#.*)?$", ln):
+            start = i
+            break
+    if start is None:                       # 没有这一段就补一个
+        lines.append("\n[bili]\n")
+        start = len(lines) - 1
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if re.match(r"^\s*\[", lines[j]):
+            end = j
+            break
+
+    pat = re.compile(rf"^(\s*{re.escape(key)}\s*=\s*)([^#\r\n]*?)(\s*#.*)?(\r?\n)?$")
+    for j in range(start + 1, end):
+        m = pat.match(lines[j])
+        if m:
+            lines[j] = f"{m.group(1)}{literal}{m.group(3) or ''}{m.group(4) or chr(10)}"
+            break
+    else:
+        lines.insert(start + 1, f"{key} = {literal}\n")
+
+    path.write_text("".join(lines), encoding="utf-8")
+    return path
 
 
 def load_config(path: Path | str = DEFAULT_CONFIG) -> tuple[BiliConfig, bool]:
@@ -196,6 +265,9 @@ def load_config(path: Path | str = DEFAULT_CONFIG) -> tuple[BiliConfig, bool]:
         keep_mp4=_as_bool(b.get("keep_mp4"), True),
         min_size_mb=float(b.get("min_size_mb") or 1),
         min_interval=int(b.get("min_interval") or 0),
+        multi_part=_as_bool(b.get("multi_part"), True),
+        part_title_template=str(b.get("part_title_template") or DEFAULT_PART_TITLE),
+        delete_after_upload=_as_bool(b.get("delete_after_upload"), False),
         base_dir=base,
     )
     if cfg.container not in ("mp4", "ts"):
@@ -496,6 +568,38 @@ def _which_ffmpeg(ffmpeg: str = "ffmpeg") -> str:
     return which(ffmpeg or "ffmpeg") or ""
 
 
+def delete_uploaded(paths: list[Path], cfg: BiliConfig, log: Callable = print) -> int:
+    """上传成功后删本地录制文件（bili.toml 里 delete_after_upload = true 才动手）。
+
+    调用点都在**确认投稿成功之后**，而且只传这次真正上传的那几个文件：
+    被 min_size_mb 跳过的、超过 4GB 没传上去的文件不在此列 —— 它们要留着补传。
+    删不掉只记一行日志，不影响投稿结果。
+    """
+    if not getattr(cfg, "delete_after_upload", False):
+        return 0
+    done = 0
+    seen: set[str] = set()
+    for p in paths:
+        p = Path(p)
+        try:
+            key = str(p.resolve()).lower()
+        except Exception:
+            key = str(p).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if not p.is_file():
+                continue
+            mb = p.stat().st_size / 1024 / 1024
+            p.unlink()
+            done += 1
+            log(f"[i] 已删除本地文件（{mb:.0f} MB，上传成功）：{p.name}")
+        except Exception as e:
+            log(f"[!] 删除失败，文件还在：{p}（{type(e).__name__}: {e}）")
+    return done
+
+
 def probe_duration(path: Path, ffmpeg: str = "ffmpeg") -> float:
     """拿时长（秒）；失败返回 0。
 
@@ -595,7 +699,10 @@ def load_failed() -> list[dict]:
 
 def _save_failed(items: list[dict]) -> None:
     try:
-        failed_path().write_text(json.dumps(items, ensure_ascii=False, indent=2),
+        clean = [{k: (v.isoformat() if isinstance(v, datetime) else v)
+                  for k, v in (it or {}).items() if k != "session"}
+                 for it in items]
+        failed_path().write_text(json.dumps(clean, ensure_ascii=False, indent=2),
                                  encoding="utf-8")
     except Exception:
         pass
@@ -605,6 +712,10 @@ def remember_failed(item: dict, error: str = "") -> None:
     """投稿失败的稿件记到磁盘（跨重启也能补传）。"""
     safe = {}
     for k, v in (item or {}).items():
+        # 场次对象里有 datetime，不能直接塞进 JSON；场次 key 已经在 session_key 里，
+        # 对应的稿件号在 bili_sessions.json 里，补传时能找回来。
+        if k == "session":
+            continue
         try:
             safe[k] = v.isoformat() if isinstance(v, datetime) else v
         except Exception:
@@ -619,6 +730,69 @@ def remember_failed(item: dict, error: str = "") -> None:
 def remove_failed(item: dict) -> None:
     items = [x for x in load_failed() if _fkey(x) != _fkey(item)]
     _save_failed(items)
+
+
+# ─────────────────── 直播场次 → 稿件（一场直播一个视频） ───────────────────
+# 同一场直播要投成**同一个稿件**的多个分P，所以得记住「这一场对应哪个稿件」。
+# bili_sessions.json: {"<房间号>-<开播时间>": {"bvid", "aid", "title", "updated"}}
+# 存盘是为了「补传」—— 程序重启后，后到的分P还知道该往哪个稿件里加。
+SESSION_FILE_NAME = "bili_sessions.json"
+_SESSION_KEEP_DAYS = 90
+
+
+def sessions_path() -> Path:
+    return APP_DIR / SESSION_FILE_NAME
+
+
+def load_sessions() -> dict:
+    try:
+        d = json.loads(sessions_path().read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_sessions(d: dict) -> None:
+    try:
+        sessions_path().write_text(json.dumps(d, ensure_ascii=False, indent=2),
+                                   encoding="utf-8")
+    except Exception:
+        pass
+
+
+def lookup_session(key: str) -> dict | None:
+    """查这一场直播已经投到哪个稿件了（没有返回 None）。"""
+    if not key:
+        return None
+    item = load_sessions().get(str(key))
+    return item if isinstance(item, dict) and item.get("bvid") else None
+
+
+def remember_session(key: str, *, bvid: str, aid: int = 0, title: str = "",
+                     anchor: str = "") -> None:
+    """记下这场直播对应的稿件 —— 后续分片靠它追加分P，重启后也认。"""
+    if not key or not bvid:
+        return
+    d = load_sessions()
+    d[str(key)] = {"bvid": bvid, "aid": int(aid or 0), "title": title or "",
+                   "anchor": anchor or "",
+                   "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    cutoff = time.time() - _SESSION_KEEP_DAYS * 86400
+    for k in list(d):
+        try:
+            ts = datetime.strptime(str(d[k].get("updated") or ""),
+                                   "%Y-%m-%d %H:%M:%S").timestamp()
+        except Exception:
+            continue
+        if ts < cutoff:
+            d.pop(k, None)
+    _save_sessions(d)
+
+
+def make_session(room_id: str, start: datetime) -> dict:
+    """一场直播的内存状态。key 用「房间号-开播时间」，关播再开播就是另一场。"""
+    return {"key": f"{room_id}-{start:%Y%m%d_%H%M%S}", "start": start,
+            "rid": str(room_id), "bvid": None, "aid": 0, "parts": 0}
 
 
 # ─────────────────── 投稿 ───────────────────
@@ -695,20 +869,198 @@ async def _do_upload(paths: list[Path], page_titles: list[str], *, title: str, d
     return result or {}
 
 
+async def _do_append(bvid: str, paths: list[Path], *, cfg: BiliConfig, cred,
+                     anchor: str = "", room_id: str = "", quality: str = "",
+                     when: datetime | None = None, durs: list[float] | None = None,
+                     multi: bool = True,
+                     log: Callable = print,
+                     progress: Callable | None = None) -> dict:
+    """往**已有稿件**追加分P。
+
+    B 站没有「给已有稿件上传一个新分P」的接口，得自己拼两步：
+      ① 用 uploader 的 preupload / 分块上传 / 提交分P 把新文件传上去 → filename + cid；
+      ② 调 archive/edit，把**原分P列表 + 新分P**整体重交一遍（原有分P要带 cid，
+         否则会被当成新分P重传 / 直接报错）。
+
+    注意：edit 会把稿件重新送回审核，标题/简介/分区/标签/封面全部按现状原样带上，
+    本函数不改这些字段 —— 只加分P。
+    """
+    from bilibili_api import video_uploader as vu
+    from bilibili_api.utils.aid_bvid_transformer import bvid2aid
+    from bilibili_api.utils.network import Api
+    from bilibili_api.utils.picture import Picture
+    from bilibili_api.video import Video
+
+    # ---- ① 稿件现状：标题/简介/分区/标签/封面 + 已有分P的 filename
+    try:
+        info = (await Api(**vu._API["upload_args"], credential=cred)
+                .update_params(bvid=bvid).result) or {}
+    except Exception as e:
+        raise BiliError(f"读不到稿件 {bvid} 的信息（{type(e).__name__}: {e}）") from e
+    archive = info.get("archive") or {}
+    old_pages = info.get("videos") or []
+    if not old_pages:
+        raise BiliError(f"稿件 {bvid} 里读不到已有分P列表，无法追加"
+                        f"（接口返回：{str(info)[:200]}）")
+
+    # edit 接口要求已有分P带上 cid。稿件信息里带就用，没带才去查播放器接口
+    # （审核中的稿件有时查不到，那就等补传，不能拿错的 cid 硬提交）
+    cids = [int(v.get("cid") or 0) for v in old_pages]
+    if not all(cids):
+        try:
+            pages = await Video(bvid=bvid, credential=cred).get_pages()
+        except Exception as e:
+            raise BiliError(
+                f"拿不到 {bvid} 的分P cid（{type(e).__name__}: {e}）。"
+                "稿件可能还在审核中，过一会儿点「补传」重试即可"
+            ) from e
+        if len(pages) < len(old_pages):
+            raise BiliError(f"稿件 {bvid} 的分P 信息不完整（{len(pages)}/{len(old_pages)}），"
+                            "过一会儿点「补传」重试")
+        cids = [int((pages[i] or {}).get("cid") or 0) for i in range(len(old_pages))]
+    if not all(cids):
+        raise BiliError(f"稿件 {bvid} 的分P cid 不完整，过一会儿点「补传」重试")
+
+    videos = [{"title": v.get("title") or "", "desc": v.get("desc") or "",
+               "filename": v.get("filename") or "", "cid": cids[i]}
+              for i, v in enumerate(old_pages)]
+    base = len(videos)
+
+    # ---- ② 传新文件（只要 filename / cid，不建稿）
+    # cover 传个空 Picture 就行：追加不动封面，不传 cover 时不该去读文件
+    uploader = vu.VideoUploader(pages=[], meta={}, credential=cred,
+                                cover=Picture(), line=None)
+    uploader.line = await vu._choose_line(vu.Lines.BDA2)
+    uploader.add_event_listener(vu.VideoUploaderEvents.AFTER_CHUNK.value,
+                               _progress(log, progress))
+    titles = part_titles(cfg, len(paths), seg_start=when or datetime.now(),
+                         durs=durs, first_part=base + 1, anchor=anchor,
+                         room_id=room_id, quality=quality)
+    for i, (p, name) in enumerate(zip(paths, titles), 1):
+        log(f"[i] 上传第 {base + i} 个分P：{name}  ← {p.name}")
+        data = await uploader._upload_page(
+            vu.VideoUploaderPage(path=str(p), title=name, description=""))
+        videos.append({"title": name, "desc": "",
+                       "filename": data.get("filename") or "",
+                       "cid": data.get("cid") or 0})
+
+    # ---- ③ 整体重交分P列表（其它字段原样保留）
+    tag = archive.get("tag") or ",".join(cfg.tags)
+    meta: dict[str, Any] = {
+        "aid": int(archive.get("aid") or bvid2aid(bvid)),
+        "title": archive.get("title") or bvid,
+        "copyright": int(archive.get("copyright") or 1),
+        "tid": int(archive.get("tid") or cfg.tid),
+        "tag": tag if isinstance(tag, str) else ",".join(map(str, tag)),
+        "desc": archive.get("desc") or "",
+        "desc_format_id": 0,
+        "dynamic": "",
+        "interactive": 0,
+        "new_web_edit": 1,
+        "act_reserve_create": 0,
+        "handle_staff": False,
+        "topic_grey": 1,
+        "no_reprint": int(archive.get("no_reprint") or 0),
+        "subtitles": {"lan": "", "open": 0},
+        "web_os": 2,
+        "cover": archive.get("cover") or "",
+        "videos": videos,
+        "csrf": cred.bili_jct,
+    }
+    params = {"csrf": cred.bili_jct, "t": int(time.time())}
+    headers = {
+        "content-type": "application/json;charset=UTF-8",
+        "referer": "https://member.bilibili.com",
+        "user-agent": UA,
+    }
+    try:
+        await (Api(**vu._API["edit"], credential=cred, no_csrf=True, json_body=True)
+               .update_params(**params).update_data(**meta)
+               .update_headers(**headers).result)
+    except Exception as e:
+        raise BiliError(
+            f"追加分P失败（{type(e).__name__}: {e}）。"
+            "常见原因：稿件状态还在流转（审核中）/ 接口抖动 —— 过一会儿点「补传」"
+            "重试即可，文件还在本地，不会白传"
+        ) from e
+
+    return {"bvid": bvid, "pages": len(videos), "added": len(paths)}
+
+
 def format_template(tpl: str, anchor: str, title: str = "", room_id: str = "",
                     quality: str = "", when: datetime | None = None,
-                    parts: int = 1, seg: int = 1, segments: int = 1) -> str:
-    """填模板。when 是**这一段录制的开始时间**，不是投稿时间。"""
+                    parts: int = 1, part: int = 1, seg: int = 1,
+                    segments: int = 1, end: datetime | None = None,
+                    dur: float = 0.0) -> str:
+    """填模板。when 是**这一场直播（这一段）的开始时间**，不是投稿时间。
+
+    end / dur 是给分P 标题用的：这一段的结束时间、时长（秒）。
+    end 为 None（时长没探出来）时 {end} 填空串，{dur} 也空。
+    """
     when = when or datetime.now()
     try:
         return tpl.format(
             anchor=anchor or "主播", title=title or "", room_id=room_id or "",
-            quality=quality or "", parts=parts, seg=seg, segments=segments,
+            quality=quality or "", parts=parts, part=part, seg=seg, segments=segments,
             date=when.strftime("%Y-%m-%d"), time=when.strftime("%H:%M"),
             datetime=when.strftime("%Y-%m-%d %H:%M:%S"),
+            start=when.strftime("%H:%M"),
+            end=end.strftime("%H:%M") if end else "",
+            dur=_hms(dur) if dur and dur > 0 else "",
         ).strip()
     except (KeyError, IndexError) as e:
         raise BiliError(f"模板里的占位符不认识：{e}（模板：{tpl!r}）") from e
+
+
+def _hms(sec: float) -> str:
+    """秒 → 时:分:秒（分P 标题里的时长用）。"""
+    sec = max(0, int(sec or 0))
+    return f"{sec // 3600:02d}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
+
+
+def part_title(cfg: BiliConfig, part: int, *, anchor: str = "", room_id: str = "",
+               quality: str = "", when: datetime | None = None,
+               dur: float = 0.0, multi: bool = True) -> str:
+    """一个分P 的名字（播放器分P列表里显示的那行，最多 80 字）。
+
+    默认模板是 `"{time}-{end}"` —— 这一段的**开始时间到结束时间**（20:00-22:00），
+    比「第 1 段」好认：B 站自己会在标题旁边标 P1/P2，不用再写一遍序号。
+    end 由 when + dur 算出来；dur 探不出来（文件坏了/抽不出时长）就只留开始时间。
+    multi=False 是「每段一个独立稿件」的老模式，分P名固定成「第 N 段」。
+    """
+    if not multi:
+        return f"第{part}段"
+    tpl = getattr(cfg, "part_title_template", "") or DEFAULT_PART_TITLE
+    end = (when + timedelta(seconds=float(dur))) if (when and dur and dur > 0) else None
+    if end is None:
+        # 时长未知：把范围那段去掉，别写成「20:00-」
+        for sep in ("-", "~", "—", "至"):
+            tpl = tpl.replace(f"{sep}{{end}}", "")
+        tpl = tpl.replace("{end}", "")
+    t = format_template(tpl, anchor=anchor, room_id=room_id, quality=quality,
+                        when=when, part=part, seg=part, end=end, dur=dur)
+    return (t or f"第{part}段")[:80]
+
+
+def part_titles(cfg: BiliConfig, count: int, *, seg_start: datetime,
+                durs: list[float] | None = None, first_part: int = 1,
+                anchor: str = "", room_id: str = "", quality: str = "") -> list[str]:
+    """一段录制（可能断流成好几个文件）对应的分P 标题列表。
+
+    每个文件一个分P；时间和时长按**累计时长**往后推 —— 第 2 个文件的开头就是
+    第 1 个文件的结尾（断流重连那几秒空档忽略），所以看到的是连续的时间区间。
+    """
+    durs = durs or []
+    out: list[str] = []
+    acc = 0.0
+    for i in range(max(0, count)):
+        d = float(durs[i]) if i < len(durs) and durs[i] and durs[i] > 0 else 0.0
+        out.append(part_title(cfg, first_part + i, anchor=anchor, room_id=room_id,
+                              quality=quality,
+                              when=seg_start + timedelta(seconds=acc), dur=d))
+        acc += d
+    return out
+
 
 
 def upload_recording(
@@ -725,16 +1077,24 @@ def upload_recording(
     seg_total: int = 1,
     log: Callable = print,
     progress: Callable | None = None,
+    session: dict | None = None,
+    part: int = 0,
 ) -> dict | None:
-    """把**一个分段**的文件投成一个稿件。
+    """把**一段录制文件**交上去：这场直播还没投过就建新稿，投过了就追加成分P。
 
-    files 是这一段产出的所有文件：只有一个就是单 P；断流重连产生的多个文件
-    会作为这个稿件的多个分P（P1/P2/…）。
-    when 是这一段录制的**开始时间**，用来填标题/简介里的 {date}{time}{datetime}；
+    files 是这一段产出的所有文件：断流重连产生的多个文件是这一段的多个连续分P。
+    when 是这一段的**开始时间**；多分P模式下标题/简介统一用整场直播的开始时间。
     seg_index / seg_total 对应占位符 {seg} / {segments}。
+
+    session: 一场直播的状态字典（见 make_session）。传了且 cfg.multi_part 为真时：
+               · 这场直播已经建过稿 → 这些文件追加成该稿件的分P（_do_append）；
+               · 还没建过稿 → 建一个新稿，并把 bvid 写回 session / bili_sessions.json。
+             不传或 cfg.multi_part 为假 → 老行为，每次调用都是独立稿件。
+    part: 这一段从第几个分P 起算（0 = 只用于日志，实际按稿件现有分P数算）。
+
     progress(pct, done_chunks, total_chunks)：上传进度回调（给界面用）。
 
-    返回 {"bvid": ...}；没有可投的文件时返回 None。
+    返回 {"bvid", "appended", "pages"}；没有可投的文件时返回 None。
     任何可预期失败都抛 BiliError。
     """
     try:
@@ -771,13 +1131,14 @@ def upload_recording(
         log("[!] 没有可投稿的文件，跳过 B 站投稿")
         return None
 
-    total_sec = 0.0
+    durs: list[float] = []
     too_long = []
     for p in usable:
         sec = probe_duration(p, ffmpeg)
-        total_sec += sec
+        durs.append(sec)
         if sec > MAX_DURATION_SEC:
             too_long.append(p.name)
+    total_sec = sum(durs)
     if too_long:
         raise BiliError(f"这些分段超过 B 站 5 小时时长上限：{', '.join(too_long)}")
 
@@ -799,7 +1160,64 @@ def upload_recording(
                 log(f"[!] 转封装失败，直接原样投稿：{p.name}")
                 to_upload.append(p)
 
-    # ---- ③ 封面：第一帧
+    # ---- ③ 这场直播投过稿了吗？投过就把这些文件追加成它的新分P
+    seg_when = when or datetime.now()      # 这一段自己的开始时间（分P 标题用）
+    video_when = seg_when                  # 稿件的标题/简介用（整场直播的开始时间）
+    multi = bool(getattr(cfg, "multi_part", True) and session)
+    target = ""
+    if multi:
+        target = str(session.get("bvid") or "")
+        if not target:
+            known = lookup_session(str(session.get("key") or ""))
+            if known:
+                target = str(known.get("bvid") or "")
+                session["bvid"] = target
+                session["aid"] = int(known.get("aid") or 0)
+                log(f"[i] 这场直播之前投过稿：{target}（记在 {SESSION_FILE_NAME} 里）")
+        # 同一场直播的所有分片共用一个稿件 —— 标题/简介里的时间用整场的开始时间，
+        # 但**分P 标题**仍然用这一段自己的开始时间（否则每个P 都写同一个钟点）。
+        if session.get("start"):
+            video_when = session["start"]
+
+    def _cleanup_mp4() -> None:
+        if made_mp4 and not cfg.keep_mp4:
+            for mp4 in made_mp4:
+                try:
+                    mp4.unlink()
+                except Exception:
+                    pass
+
+    # 前面的分P 没传成功时，后面的分P 绝不能自己另起一个视频 —— 那样 P1 就跑到
+    # 另一个稿件里去了，分P 顺序也乱了。记进待补传，补传时按 P1→P2→P3 顺序重投。
+    if multi and not target and int(part or 0) > 1:
+        raise BiliError(
+            f"不能单独建稿：这是这场直播的第 {part} 个分P，前面的分P 还没传成功。"
+            "已记入待补传清单，点「补传」会按顺序重投（文件都还在本地）")
+
+    cred = _credential_object(read_credential(cfg.cred_file) or {})
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+    # ---- ④ 已有稿件：上传新文件 + 重交分P列表
+    if target:
+        log(f"[i] 第 {seg_index} 段：这场直播的稿件是 {target}，"
+            f"这 {len(to_upload)} 个文件追加为分P"
+            + (f"（从 P{part} 起）" if part else ""))
+        try:
+            added = asyncio.run(_do_append(
+                target, to_upload, cfg=cfg, cred=cred, anchor=anchor,
+                room_id=str(room_id), quality=quality, when=seg_when, durs=durs,
+                log=log, progress=progress))
+        finally:
+            _cleanup_mp4()
+        pages = int((added or {}).get("pages") or 0)
+        log(f"[√] 已追加 {len(to_upload)} 个分P → "
+            f"https://www.bilibili.com/video/{target}（共 {pages} P）")
+        log("    编辑会把稿件重新送审，审核通过后新分P才可见。")
+        delete_uploaded(usable + made_mp4, cfg, log)     # 上传成功才删
+        return {"bvid": target, "appended": True, "pages": pages}
+
+    # ---- ⑤ 封面：第一帧（建新稿必须给封面；追加分P不动封面）
     cover_path = Path(tempfile.gettempdir()) / "bili_cover_douyin.jpg"
     cover = None
     log(f"[i] 抽取封面（第 {cfg.cover_position} 秒{'，即第一帧' if not cfg.cover_position else ''}）"
@@ -812,55 +1230,60 @@ def upload_recording(
         raise BiliError("抽第一帧失败，拿不到封面（B 站投稿必须给封面）。"
                         "确认 ffmpeg 可用，或装 opencv-python 作为备选。")
 
-    # ---- ④ 组标题/简介（时间用**这一段的开始时间**，不是投稿时间）
-    now = when or datetime.now()
+    # ---- ⑥ 组标题/简介（时间用**这一场直播的开始时间**，不是投稿时间）
     title = format_template(cfg.title_template, anchor=anchor, title=live_title,
-                            room_id=str(room_id), quality=quality, when=now,
+                            room_id=str(room_id), quality=quality, when=video_when,
                             parts=len(to_upload), seg=seg_index, segments=seg_total)
     desc = format_template(cfg.desc_template, anchor=anchor, title=live_title,
-                           room_id=str(room_id), quality=quality, when=now,
-                           parts=len(to_upload), seg=seg_index, segments=seg_total)
+                           room_id=str(room_id), quality=quality, when=video_when,
+                           parts=len(to_upload), part=part or 1,
+                           seg=seg_index, segments=seg_total)
     if len(title) > 80:
         title = title[:80]
         log(f"[!] 标题超过 80 字，已截断：{title}")
     if len(desc) > 2000:
         desc = desc[:2000]
     if not title:
-        title = f"{anchor or '直播'}回放 {now:%Y-%m-%d %H:%M}"
+        title = f"{anchor or '直播'}回放 {video_when:%Y-%m-%d %H:%M}"
     tags = cfg.tags[:10] if cfg.tags else ["直播回放"]
 
-    if len(to_upload) == 1:
+    if multi:
+        # 分P 模式下一开始就把每页的标题写好 —— 后面追加的分P 会跟它对上号。
+        # 标题是「这一段自己的开始时间-结束时间」，不是整场的时间。
+        page_titles = part_titles(cfg, len(to_upload), seg_start=seg_when,
+                                  durs=durs, first_part=1, anchor=anchor,
+                                  room_id=str(room_id), quality=quality)
+    elif len(to_upload) == 1:
         page_titles = [""]     # 单 P 留空，播放页只显示主标题
     else:
         page_titles = [f"第{i}段" for i in range(1, len(to_upload) + 1)]
 
-    # ---- ⑤ 上传
+    # ---- ⑦ 上传（建新稿）
     log(f"[i] 开始投稿第 {seg_index}/{seg_total} 段：{len(to_upload)} 个分P，"
         f"共 {total_sec / 60:.1f} 分钟")
     log(f"    标题：{title}")
-    if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    result = asyncio.run(_do_upload(
-        to_upload, page_titles, title=title, desc=desc, tid=cfg.tid, tags=tags,
-        original=cfg.original, no_reprint=cfg.no_reprint,
-        cover=cover, cred=_credential_object(read_credential(cfg.cred_file) or {}),
-        log=log, progress=progress))
+    if multi:
+        log(f"    这场直播后面的分片都会追加成这个稿件的分P")
+    try:
+        result = asyncio.run(_do_upload(
+            to_upload, page_titles, title=title, desc=desc, tid=cfg.tid, tags=tags,
+            original=cfg.original, no_reprint=cfg.no_reprint,
+            cover=cover, cred=cred, log=log, progress=progress))
+    finally:
+        _cleanup_mp4()
     bvid = (result or {}).get("bvid")
     if not bvid:
         raise BiliError(f"投稿没有返回 bvid，接口原样返回：{result}")
+    if session is not None and multi:
+        session["bvid"] = bvid
+        session["aid"] = int((result or {}).get("aid") or 0)
+        session["parts"] = len(to_upload)
+        remember_session(str(session.get("key") or ""), bvid=bvid,
+                         aid=session["aid"], title=title, anchor=anchor)
     log(f"[√] 投稿完成：https://www.bilibili.com/video/{bvid}")
     log("    稿件需审核通过后才会公开。")
-
-    # ---- ⑥ 清理转封装临时文件
-    if made_mp4 and not cfg.keep_mp4:
-        for p in made_mp4:
-            try:
-                p.unlink()
-                log(f"[i] 已删除临时文件 {p.name}")
-            except Exception:
-                pass
-
-    return {"bvid": bvid}
+    delete_uploaded(usable + made_mp4, cfg, log)         # 上传成功才删
+    return {"bvid": bvid, "appended": False, "pages": len(to_upload)}
 
 
 def upload_segments(
@@ -873,18 +1296,28 @@ def upload_segments(
     quality: str = "",
     ffmpeg: str = "ffmpeg",
     log: Callable = print,
+    session: dict | None = None,
 ) -> list[dict]:
-    """把一次录制产出的**多个分段**分别投成独立稿件。
+    """把一次录制产出的**多个分段**交上去。
+
+    cfg.multi_part = true（默认）：这些分段属于**同一场直播**，投成同一个稿件的
+    P1/P2/P3…（第一段建稿，后面每段追加分P）。
+    cfg.multi_part = false：每段一个独立稿件（老行为）。
 
     segments: [{"start": datetime, "files": [路径, ...]}, ...]
-              每段的 {start} 会填进标题的 {date}/{time}/{datetime}；
-              同一段里断流重连产生的多个文件是该稿件的多个分P。
+              每段的 {start} 填进标题的 {date}/{time}/{datetime}；
+              同一段里断流重连产生的多个文件是该段的多个连续分P。
 
-    某一段失败不影响其它段，返回成功的那些（每项 {"bvid": ...}）。
+    某一段失败不影响其它段，返回成功的那些。
     """
     throttle = SubmitThrottle(getattr(cfg, "min_interval", 0))
     total = len(segments)
+    multi = bool(getattr(cfg, "multi_part", True))
+    if multi and session is None and segments:
+        session = make_session(str(room_id),
+                               segments[0].get("start") or datetime.now())
     out: list[dict] = []
+    part = 1
     for i, seg in enumerate(segments, 1):
         files = list(seg.get("files") or [])
         when = seg.get("start") or datetime.now()
@@ -895,12 +1328,15 @@ def upload_segments(
             info = upload_recording(
                 files, anchor=anchor, cfg=cfg, room_id=room_id, live_title=live_title,
                 quality=quality, ffmpeg=ffmpeg,
-                when=when, seg_index=i, seg_total=total, log=log)
+                when=when, seg_index=i, seg_total=total, log=log,
+                session=session, part=part)
         except Exception as e:
             log(f"[!] 第 {i} 段投稿失败，继续下一段：{type(e).__name__}: {e}")
             for line in explain_network_error(e):
                 log("    " + line)
+            part += len(files)
             continue
+        part += len(files)
         if info:
             out.append(info)
     return out

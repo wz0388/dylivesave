@@ -14,16 +14,31 @@ no_reprint = true              # true=禁止转载
 # 标题/简介模板，可用占位符：
 #   {anchor} 主播昵称   {title} 直播间标题   {date} 日期   {time} 时间
 #   {datetime} 日期时间   {quality} 清晰度   {room_id} 房间号
-#   {seg} 这是第几段   {segments} 总段数
+#   {seg} 这是本次录制交出去的第几段   {segments} 总段数（「分段即传」时未知，填 0）
+#   {part} 这一段从第几个分P开始   {parts} 这一段包含几个分P
 #
-# 注意 {date}/{time}/{datetime} 取的是**这一段录制的开始时间**（不是投稿时间）——
-# 录播按 2 小时分段后，靠它区分同一天的多个稿件。
-# 一定要带上 {time}，否则同一天的多段标题会重复，B 站会拒（短时间内标题不能相同）。
+# 注意 {date}/{time}/{datetime} 取的是**这一场直播的开始时间**（不是投稿时间）。
+# 一场直播 = 一个稿件，关播再开播是另一场，靠时间区分同一天的多个稿件。
 title_template = "{anchor} 直播回放 {date} {time}"
-desc_template = """{anchor} 的直播回放（第 {seg}/{segments} 段）
+desc_template = """{anchor} 的直播回放（第 {seg} 段，分P 从第 {part} 段起）
 直播间：https://live.douyin.com/{room_id}
 本段开始：{datetime}
 清晰度：{quality}"""
+
+# 一场直播投成一个稿件，同一场直播的各分片当这个稿件的 P1/P2/P3…
+# 关播再开播算新的一场，投成新稿件。设成 false 退回老行为：每段一个独立稿件。
+multi_part = true
+# 分P标题模板（播放器分P列表里显示的名字）。默认是「这一段的开始时间-结束时间」，
+# 因为 B 站自己会在旁边标 P1/P2，不用再写「第 N 段」。
+# 可用：{time} 开始时间  {end} 结束时间  {dur} 时长(00:00:00)  {start} 同 {time}
+#       {part} 第几个分P  {date}/{datetime}/{anchor}/{quality}/{room_id}
+# B 站分P标题上限 80 字。
+part_title_template = "{time}-{end}"
+
+# 投稿成功后删掉本地录制文件（默认关，界面上也有同一个开关）。
+# 只删「这一批真正传上去、且确认投稿成功」的文件；被 min_size_mb 跳过或超过
+# 4GB 没传上去的不动（那些要留着补传）。⚠️ 删了找不回来，想留档就别开。
+delete_after_upload = false
 
 cover_position = 0             # 封面取第几秒的画面；0 = 视频第一帧
 container = 'ts'               # ts = 直接传（B 站云端转码，推荐）；mp4 = 先无损转封装再传

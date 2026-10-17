@@ -13,6 +13,8 @@ logs/
 record_gui.json
 # 「投稿失败」的待补传清单（点「补传」或 --bili-retry 重投）
 bili_failed_uploads.json
+# 场次 → 稿件（bvid）对照表：同一场直播的分片靠它追加成同一个视频的分P
+bili_sessions.json
 
 # ═══ 打包产物 ═══
 *.exe
@@ -34,3 +36,4 @@ env/
 .DS_Store
 Thumbs.db
 desktop.ini
+.workbuddy/

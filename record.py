@@ -19,8 +19,11 @@
 _part2.ts；切成新的一段时会用**新一段的开始时间**重新起名，所以文件名能看出分段。
 需要 ffmpeg 在 PATH 里（或用 --ffmpeg 指定路径）。
 
-录完（直播结束 / 到时长 / Ctrl+C）会按 bili.toml 的配置把**每段单独投成一个 B 站稿件**，
-标题里带该段的开始时间（不管合集）。不想投稿加 --no-bili。
+投稿按「场次」走（bili.toml 里 multi_part = true，默认）：
+  · **一场直播 = 一个 B 站稿件**：这一场切出来的所有分段（以及断流重连的 _partN）
+    都是这个稿件的 P1/P2/P3…，每段录完就传，传完立刻用编辑接口追加成新分P；
+  · **关播再开播 = 新的一场 → 新稿件**，不会追加到上一场那个视频里。
+不想投稿加 --no-bili；想退回「每段一个独立稿件」把 multi_part 设成 false。
 """
 import argparse
 import os
@@ -82,7 +85,14 @@ def fmt_dur(sec):
     return f"{s}s"
 
 
-def log(*a):
+def fmt_hms(sec):
+    """时长写成 时:分:秒（录制进度用，位数固定，扫一眼就知道录了多久）。"""
+    sec = max(0, int(sec or 0))
+    return f"{sec // 3600:02d}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
+
+
+def log(*a, live: str = ""):
+    """命令行日志。live 是「进度型」日志的 key（界面用它原地更新同一行），这里用不上。"""
     try:
         print(f"[{datetime.now().strftime('%H:%M:%S')}]", *a, flush=True)
     except Exception:
@@ -92,6 +102,28 @@ def log(*a):
 #: 模块级 log 的别名。下面有些函数会定义同名的局部 log 来遮蔽它，
 #: 遮蔽之后函数体里就再也拿不到模块级那个了，所以先留个别名备用。
 _module_log = log
+
+
+def emit_log(fn, line: str, live: str = "") -> None:
+    """调日志回调，顺便把「这一行是进度，key 是 live」告诉它。
+
+    界面（record_gui）认 live：同一个 key 在控制台只留最新一条，旧的删掉；
+    日志文件照样全收。不认这个参数的回调（print / 外部自定义的）就退回普通调用。
+    """
+    try:
+        if live:
+            fn(line, live=live)
+        else:
+            fn(line)
+        return
+    except TypeError:
+        pass
+    except Exception:
+        return
+    try:
+        fn(line)
+    except Exception:
+        pass
 
 
 def safe_name(text, fallback="live"):
@@ -197,6 +229,38 @@ def probe(path, ffmpeg_dir=""):
     return (out.stdout or "").strip()
 
 
+class LiveSession:
+    """一场直播 = B 站上的一个稿件，这场直播的每个分片是它的 P1/P2/P3…
+
+    判定「是不是同一场」只看录制循环：一次连续的录制（开播 → 下播/停止）就是一场。
+    下播之后主播再开播，run_one_room 会重新进一次录制循环 —— 那是**新的一场**，
+    投成**新稿件**，不会被追加到上一场那个视频里。
+
+    key 用「房间号-开播时间」，既区分不同主播，也区分同一主播的不同场次；
+    bvid 由后台上传队列写回来（bili_uploader.upload_recording），后续分片靠它追加分P。
+    """
+
+    def __init__(self, rid, start=None):
+        self.start = start or datetime.now()
+        self.key = f"{rid}-{self.start:%Y%m%d_%H%M%S}"
+        self.state = {"key": self.key, "start": self.start, "rid": str(rid),
+                      "bvid": None, "aid": 0, "parts": 0}
+        self.next_part = 1
+
+    @property
+    def bvid(self):
+        return self.state.get("bvid")
+
+    def take_parts(self, n):
+        """登记这一段要占几个分P，返回起始分P号（1 起，和 B 站的分P 序号一致）。"""
+        first = self.next_part
+        self.next_part += max(0, int(n or 0))
+        return first
+
+    def __repr__(self):
+        return f"<LiveSession {self.key} bvid={self.bvid}>"
+
+
 class UploadWorker:
     """后台上传队列：分段一录完就扔进来，录制线程立刻接着录下一段。
 
@@ -273,8 +337,14 @@ class UploadWorker:
                                         daemon=True)
         self._thread.start()
 
-    def submit(self, seg: dict, *, rid, anchor, live_title, quality, ffmpeg) -> None:
-        """把一个录完的分段交给后台上传（立刻返回，不阻塞录制）。"""
+    def submit(self, seg: dict, *, rid, anchor, live_title, quality, ffmpeg,
+               session=None, part=1) -> None:
+        """把一个录完的分段交给后台上传（立刻返回，不阻塞录制）。
+
+        session: 这一场直播的状态（LiveSession.state）。传了且 bili.toml 里
+                 multi_part = true 时，同一场的每一段都会追加成**同一个稿件**的分P。
+        part:    这一段从第几个分P 起算（1 起）。
+        """
         files = list(seg.get("files") or [])
         if not files:
             return
@@ -284,13 +354,29 @@ class UploadWorker:
             self._pending += 1
         self.q.put(dict(seq=seq, start=seg.get("start"), files=files,
                         rid=str(rid), anchor=anchor, live_title=live_title,
-                        quality=quality, ffmpeg=ffmpeg))
+                        quality=quality, ffmpeg=ffmpeg,
+                        session=session,
+                        session_key=str((session or {}).get("key") or ""),
+                        part=int(part or 0)))
         self.start()
-        self.log(f"[i] 第 {seq} 段已交给后台上传（队列里还有 {self.pending()} 段）")
+        extra = ""
+        if session:
+            extra = f"（这场直播的分P 从 P{part} 起，共 {len(files)} 个）"
+        self.log(f"[i] 第 {seq} 段已交给后台上传{extra}（队列里还有 {self.pending()} 段）")
 
     def pending(self) -> int:
         with self._lock:
             return self._pending
+
+    def reload_cfg(self) -> None:
+        """配置可能被界面改过（比如勾了「上传成功后删除本地视频」）→ 下次上传重新读。
+
+        只清缓存，不打断正在传的那一段：下一次 _ensure_cfg() 会重新读 bili.toml
+        并再实测一次登录态。
+        """
+        self._cfg_checked = False
+        self._cfg = None
+        self._cred_problem = ""
 
     def _loop(self) -> None:
         while True:
@@ -304,27 +390,43 @@ class UploadWorker:
                     self._pending -= 1
                 self.q.task_done()
 
-    def _notify(self, seq, phase, pct, anchor="", done=0, total=0) -> None:
+    def _notify(self, seq, phase, pct, anchor="", done=0, total=0, label="") -> None:
         """给界面发上传事件：phase ∈ start / progress / ok / fail。
 
         done/total 是**分块数**（B 站固定 10MB 一块）——
         大文件只报百分比会长时间停在 0%，界面上按「0%（2/205 块）」显示才看得出在动。
+        label 是表格里「段」那一列的显示文字（同一场直播的分P 会带 P 号）。
         """
         if self._progress is None:
             return
         try:
-            self._progress(seq, phase, pct, anchor, done, total)
+            self._progress(seq, phase, pct, anchor, done, total, label)
+        except TypeError:              # 老回调只收 6 个参数
+            try:
+                self._progress(seq, phase, pct, anchor, done, total)
+            except Exception:
+                pass
         except Exception:
             pass
 
+    @staticmethod
+    def _label(item) -> str:
+        """表格里「段」那一列：#3 P2 = 第 3 段、这场直播的第 2 个分P。"""
+        seq = item.get("seq", "?")
+        part = int(item.get("part") or 0)
+        if item.get("session") and part:
+            return f"#{seq} P{part}"
+        return f"#{seq}"
+
     def _run_one(self, item) -> None:
+        label = self._label(item)
         if not self._ensure_cfg():
             import bili_uploader as bu
             if self._cred_problem:
                 # 登录态失效：不是「不必传」，而是「传不了」—— 记成待补传，别丢了
                 self.failed.append(item)
                 bu.remember_failed(item, self._cred_problem)
-                self._notify(item["seq"], "fail", 0, item.get("anchor") or "")
+                self._notify(item["seq"], "fail", 0, item.get("anchor") or "", label=label)
                 self.log(f"[!] 第 {item['seq']} 段没传：{self._cred_problem}")
                 self.log(f"    已记到 {bu.failed_path().name}，重新登录后点「补传」即可")
             else:
@@ -335,17 +437,24 @@ class UploadWorker:
         if self._throttle is None:
             self._throttle = bu.SubmitThrottle(getattr(self._cfg, "min_interval", 0))
         self._throttle.wait(self.log)
-        self._notify(item["seq"], "start", 0, item.get("anchor") or "")
-        self.log(f"[i] 后台开始上传第 {item['seq']} 段：{len(item['files'])} 个文件")
+        self._notify(item["seq"], "start", 0, item.get("anchor") or "", label=label)
+        hint = ""
+        if item.get("session"):
+            if item["session"].get("bvid") or bu.lookup_session(item.get("session_key", "")):
+                hint = f"（追加到 {item['session'].get('bvid') or '这场直播已有的稿件'}）"
+            else:
+                hint = "（这场直播的第 1 段，会新建一个稿件）"
+        self.log(f"[i] 后台开始上传第 {item['seq']} 段：{len(item['files'])} 个文件{hint}")
         try:
             info = bu.upload_recording(
                 item["files"], anchor=item["anchor"], cfg=self._cfg,
                 room_id=item["rid"], live_title=item["live_title"],
                 quality=item["quality"], ffmpeg=item["ffmpeg"],
                 when=item["start"], seg_index=item["seq"], seg_total=0,
-                log=self.log,
+                log=self.log, session=item.get("session"),
+                part=int(item.get("part") or 0),
                 progress=lambda pct, d, t: self._notify(
-                    item["seq"], "progress", pct, "", d, t))
+                    item["seq"], "progress", pct, "", d, t, label))
         except Exception as e:
             self.log(f"[!] 第 {item['seq']} 段投稿失败：{type(e).__name__}: {e}")
             for line in bu.explain_network_error(e):
@@ -353,16 +462,22 @@ class UploadWorker:
             self.failed.append(item)
             bu.remember_failed(item, f"{type(e).__name__}: {e}")
             self.log(f"    已记到 {bu.failed_path().name}，点「补传」或下次启动时会再投")
-            self._notify(item["seq"], "fail", 0, item.get("anchor") or "")
+            self._notify(item["seq"], "fail", 0, item.get("anchor") or "", label=label)
             return
         bu.remove_failed(item)
         if info:
             self.results.append(info)
-            self.log(f"[√] 第 {item['seq']} 段投稿完成：{info['bvid']}")
-            self._notify(item["seq"], "ok", 100, item.get("anchor") or "")
+            if info.get("appended"):
+                self.log(f"[√] 第 {item['seq']} 段已追加为分P：{info['bvid']}"
+                         f"（该稿件现在 {info.get('pages', '?')} P）")
+            else:
+                self.log(f"[√] 第 {item['seq']} 段投稿完成：{info['bvid']}"
+                         + ("（新建的稿件，后面的分片都会追加到这里）"
+                            if item.get("session") else ""))
+            self._notify(item["seq"], "ok", 100, item.get("anchor") or "", label=label)
         else:
             self.log(f"[i] 第 {item['seq']} 段没有可投稿的文件（可能已被删除），跳过")
-            self._notify(item["seq"], "fail", 0)
+            self._notify(item["seq"], "fail", 0, label=label)
 
     def retry_failed(self, log=None) -> int:
         """把投稿失败的稿件重新排队上传（界面「补传」按钮 / CLI --bili-retry）。
@@ -397,8 +512,13 @@ class UploadWorker:
         self.failed = []
         bu._save_failed([])
 
+        # 同一场直播的分P 必须按 P 顺序补：P1 建稿 → P2/P3 追加，乱序会挂到错的地方
+        def _order(it):
+            return (str(it.get("session_key") or "~"), int(it.get("part") or 1))
+
         n = 0
-        for it in items.values():
+        skipped: list[dict] = []
+        for it in sorted(items.values(), key=_order):
             when = it.get("start")
             if isinstance(when, str):
                 try:
@@ -408,13 +528,34 @@ class UploadWorker:
             missing = [f for f in (it.get("files") or []) if not os.path.isfile(f)]
             if missing:
                 _log(f"[!] 第 {it.get('seq')} 段的文件已不在本地，跳过：{missing[0]}")
+                skipped.append(it)
                 continue
-            self.q.put({**it, "start": when})
+
+            # 重建这一场直播的状态（进程重启后就靠 bili_sessions.json 找回稿件）
+            session = None
+            key = str(it.get("session_key") or "")
+            if key:
+                known = bu.lookup_session(key) or {}
+                session = {"key": key, "start": when, "rid": str(it.get("rid") or ""),
+                           "bvid": known.get("bvid"), "aid": int(known.get("aid") or 0),
+                           "parts": 0}
+                part = int(it.get("part") or 1)
+                if part > 1 and not known.get("bvid"):
+                    _log(f"[!] 第 {it.get('seq')} 段是这场直播的第 {part} 个分P，"
+                         "但它的稿件还没建起来（前面的分P 没传成功）——先补传前面的")
+                    skipped.append(it)
+                    continue
+
+            self.q.put({**it, "start": when, "session": session})
             with self._lock:
                 self._pending += 1
             n += 1
+        if skipped:
+            bu._save_failed(skipped)
         self.start()
         _log(f"[i] 补传：{n} 段已重新排队，串行上传（节流和进度照常生效）")
+        if skipped:
+            _log(f"[!] 还有 {len(skipped)} 段留在待补传清单里（原因见上）")
         return n
 
     def wait(self, timeout=None) -> bool:
@@ -498,10 +639,11 @@ def resolve_upload_config(config_path="", force=False, no_bili=False, log=None):
 
 def upload_to_bili(segments, *, rid, anchor, live_title, quality, ffmpeg,
                    config_path="", force=False, no_bili=False, logf=None):
-    """录完之后把每个分段投成**独立稿件**（配置见 bili.toml）。
+    """录完之后把这一场直播的分段交上去（配置见 bili.toml）。
 
+    这些 segments 都是**同一场直播**的：bili.toml 里 multi_part = true（默认）时
+    投成一个稿件的 P1/P2/P3…；设成 false 就退回「每段一个独立稿件」。
     segments: [{"start": datetime, "files": [路径, ...]}, ...]
-              标题里的时间用每段自己的 start。
     logf: 自定义日志回调（GUI 用它把输出接到界面），默认走模块级 log。
 
     全程不抛异常：投稿是录制流程的附加步骤，失败了不该影响已经录好的文件。
@@ -531,8 +673,12 @@ def upload_to_bili(segments, *, rid, anchor, live_title, quality, ffmpeg,
 
     n_files = sum(len(s["files"]) for s in segs)
     log("=" * 58)
-    log(f"开始投稿到 B 站：{len(segs)} 个分段（共 {n_files} 个文件），"
-        f"封面取第一帧，格式 {cfg.container}")
+    if getattr(cfg, "multi_part", True):
+        log(f"开始投稿到 B 站：{len(segs)} 个分段（共 {n_files} 个文件）→ "
+            f"投成**同一个稿件**的 {n_files} 个分P")
+    else:
+        log(f"开始投稿到 B 站：{len(segs)} 个分段（共 {n_files} 个文件）→ 每段一个独立稿件")
+    log(f"封面取第一帧，格式 {cfg.container}")
     try:
         results = bu.upload_segments(
             segs, anchor=anchor, cfg=cfg, room_id=str(rid), live_title=live_title,
@@ -545,9 +691,10 @@ def upload_to_bili(segments, *, rid, anchor, live_title, quality, ffmpeg,
 
     log("")
     if results:
-        log(f"投稿完成：{len(results)}/{len(segs)} 段")
-        for r in results:
-            log(f"   {r['bvid']}")
+        bvids = {r.get("bvid") for r in results if r.get("bvid")}
+        log(f"投稿完成：{len(results)}/{len(segs)} 段，共 {len(bvids)} 个稿件")
+        for bv in bvids:
+            log(f"   {bv}")
     else:
         log("[!] 没有任何一段投稿成功")
 
@@ -570,18 +717,19 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
       uploader     给了就在**每段录完的当下**交给后台上传（录制不等它）；
                    不传则退回「整场录完再一起传」
 
-    返回：{"segments": [...], "files": [...], "anchor": 主播昵称}；
+    投稿粒度：**一次调用 = 一场直播 = 一个 B 站稿件**。这次调用里切出来的每一段
+    都是该稿件的分P（P1/P2/…）；下播后主播再开播由 run_one_room 重新调一次本函数，
+    那就是新的一场 → 新稿件。
+
+    返回：{"segments": [...], "files": [...], "anchor": 主播昵称, "session": 场次key}；
           被取消 / 没录到东西时返回 None。失败抛 RecordError。
     """
     # 注意：下面定义了局部 log()，函数体里就不能再引用模块级 log 了，用别名
     _log = logf or _module_log
 
-    def log(*args):                   # 局部遮蔽模块级 log，把输出交给调用方
+    def log(*args, live: str = ""):    # 局部遮蔽模块级 log，把输出交给调用方
         msg = " ".join(str(x) for x in args)
-        try:
-            _log(f"[{tag}] {msg}" if tag else msg)
-        except Exception:
-            pass
+        emit_log(_log, f"[{tag}] {msg}" if tag else msg, live)
 
     out_dir = out_dir or DEFAULT_DIR
     # 凑成原来的 a.xxx 形式，下面的录制逻辑就不用改
@@ -646,13 +794,19 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
 
     os.makedirs(a.dir, exist_ok=True)
 
+    # 这一场直播 = 一个 B 站稿件：本场所有的分段都投成它的 P1/P2/P3…
+    # 下播后再开播会重新进一次 run_recording，那是新的一场 → 新稿件。
+    session = LiveSession(rid)
+    log(f"本场直播：{session.key}（同一场的分片会投成同一个稿件的分P，"
+        "关播再开播算新的一场）")
+
     # ---- 录制：断流自动重连 + 按 --segment 分段（默认 2 小时一段）
     deadline = time.time() + a.duration if a.duration > 0 else None
     MAX_FILES = 200                      # 防止死循环的兜底
     segments = []                        # [{"start": datetime, "files": [...], "closed": bool}]
     files = []                           # 扁平列表，给汇总和 TS 自检用
     end_upload = []                      # 没有后台队列时，攒到最后一起传
-    part = 0
+    file_count = 0
     stopped = False
     protocol = a.protocol
     prefix = safe_name(a.name or streams.anchor)
@@ -668,21 +822,25 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
     def hand_over(seg):
         """这一段录完了：交给后台上传（**不等它**，录制立刻继续）。
 
+        这一段占几个分P 在这里预先登记好（断流重连会一段多文件 → 多个分P），
+        这样后台上传时才知道该往稿件的第几个 P 上挂。
         没有后台队列就攒起来，等整场录完一起传（命令行单独用的老行为）。
         """
         if not upload:
             return
+        n = len(seg.get("files") or [])
         if uploader is not None:
             uploader.submit(seg, rid=rid, anchor=streams.anchor,
                             live_title=streams.title, quality=quality,
-                            ffmpeg=ffmpeg)
+                            ffmpeg=ffmpeg, session=session.state,
+                            part=session.take_parts(n))
         else:
             end_upload.append(seg)
 
     base = ""
     file_no = 0
     try:
-        while part < MAX_FILES:
+        while file_count < MAX_FILES:
             if deadline and time.time() >= deadline:
                 break
             if not segments or segments[-1]["closed"]:
@@ -690,7 +848,7 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
                 file_no = 0
             cur = segments[-1]
 
-            part += 1
+            file_count += 1
             file_no += 1
             out = os.path.join(a.dir, base + ("" if file_no == 1 else f"_part{file_no}") + ".ts")
             left, capped = plan_segment(deadline, a.segment, time.time())
@@ -707,7 +865,9 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
                     stopped = True
                     break
                 if time.time() - last_report >= 15 and os.path.exists(out):
-                    log(f"  已写 {human(os.path.getsize(out))}")
+                    # live=房间号：界面里这个房间的「已写」只留一条，就地刷新
+                    log(f"  已写 {human(os.path.getsize(out))}，已录 {fmt_hms(time.time() - seg_start)}",
+                        live=f"rec:{rid}")
                     last_report = time.time()
             if proc.poll() is None:          # 到点了，让它收尾
                 try:
@@ -789,27 +949,37 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
     log("录制完成：")
     total = 0
     for i, seg in enumerate(segments, 1):
-        seg_size = sum(os.path.getsize(f) for f in seg["files"] if os.path.exists(f))
+        # 开了「上传成功后删本地视频」的话，早几段这会儿已经被删了 —— 别拿 getsize 去碰它
+        sizes = [(f, os.path.getsize(f) if os.path.exists(f) else None)
+                 for f in seg["files"]]
+        seg_size = sum(s for _, s in sizes if s)
         total += seg_size
         log(f"   第 {i} 段（{seg['start']:%H:%M:%S} 开始）{len(seg['files'])} 个文件，"
             f"{human(seg_size)}")
-        for f in seg["files"]:
-            log(f"      {os.path.basename(f)}  ({human(os.path.getsize(f))})")
+        for f, s in sizes:
+            if s is None:
+                log(f"      {os.path.basename(f)}（已删除：上传成功）")
+            else:
+                log(f"      {os.path.basename(f)}  ({human(s)})")
     log(f"合计 {human(total)}，共 {len(files)} 个文件 / {len(segments)} 段")
-    info = probe(files[0], a.ffmpeg)
-    if info:
-        log("ffprobe：")
-        for line in info.splitlines():
-            log("   " + line)
-    # TS 同步字节自检（每个 TS 包应是 188 字节，开头是 0x47）
-    try:
-        with open(files[0], "rb") as fh:
-            head = fh.read(188 * 3)
-        ok_head = len(head) >= 188 and head[0] == 0x47 and head[188] == 0x47
-        log("TS 封装自检: " + ("通过（0x47 同步字节，188 字节包）" if ok_head
-                              else "异常，文件可能不完整"))
-    except Exception as e:
-        log(f"TS 自检跳过：{e}")
+    alive = [f for f in files if os.path.exists(f)]
+    if not alive:
+        log("本地文件已按「上传成功后删除本地视频」清掉，跳过 ffprobe / TS 自检")
+    else:
+        info = probe(alive[0], a.ffmpeg)
+        if info:
+            log("ffprobe：")
+            for line in info.splitlines():
+                log("   " + line)
+        # TS 同步字节自检（每个 TS 包应是 188 字节，开头是 0x47）
+        try:
+            with open(alive[0], "rb") as fh:
+                head = fh.read(188 * 3)
+            ok_head = len(head) >= 188 and head[0] == 0x47 and head[188] == 0x47
+            log("TS 封装自检: " + ("通过（0x47 同步字节，188 字节包）" if ok_head
+                                  else "异常，文件可能不完整"))
+        except Exception as e:
+            log(f"TS 自检跳过：{e}")
 
     # ---- 最后一段（没被分段上限收掉的那段）也交出去
     if segments and not segments[-1].get("closed"):
@@ -823,7 +993,8 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
                        live_title=streams.title, quality=quality, ffmpeg=ffmpeg,
                        config_path=a.bili_config, force=a.bili, no_bili=a.no_bili,
                        logf=logf)
-    return {"segments": segments, "files": files, "anchor": streams.anchor}
+    return {"segments": segments, "files": files, "anchor": streams.anchor,
+            "session": session.key, "bvid": session.bvid}
 
 
 def run_one_room(rid, *, tag="", logf=None, monitor=False, **kw):
@@ -833,12 +1004,9 @@ def run_one_room(rid, *, tag="", logf=None, monitor=False, **kw):
     回到「等开播」的循环（每 30 秒重试一次拉流），开播了自动接着录下一场。
     指定了录制时长（duration > 0）的算一次性任务，录满就停，监控不生效。
     """
-    def log(*a):
+    def log(*a, live: str = ""):
         msg = " ".join(str(x) for x in a)
-        try:
-            (logf or _module_log)(f"[{tag or rid}] {msg}")
-        except Exception:
-            pass
+        emit_log(logf or _module_log, f"[{tag or rid}] {msg}", live)
 
     session = 0
     while True:
@@ -898,7 +1066,8 @@ def main():
     ap.add_argument("--duration", type=int, default=0, help="录制秒数，0 = 一直录到 Ctrl+C")
     ap.add_argument("--segment", type=int, default=7200,
                     help="每多少秒切一段，默认 7200（2 小时），0 = 不分段。"
-                         "每段会单独投成一个 B 站稿件，标题带上该段开始时间")
+                         "同一场直播的各段会投成同一个稿件的不同分P；"
+                         "关播再开播算新的一场，投成新稿件")
     ap.add_argument("--dir", default=DEFAULT_DIR, help=f"输出目录，默认 {DEFAULT_DIR}")
     ap.add_argument("--name", default="", help="文件名前缀，默认用主播昵称")
     ap.add_argument("--ffmpeg", default="", help="ffmpeg 路径，默认用 PATH 里的")
