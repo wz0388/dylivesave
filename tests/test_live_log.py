@@ -73,7 +73,10 @@ def test_console_single_line() -> None:
         log(app, f"[1001] 已写 {i + 1}.00 GB，已录 00:0{i}:15", "rec:1001")
     log(app, "[1002] 已写 9.00 GB，已录 01:00:00", "rec:1002")   # 另一个直播间
     log(app, "[1001] 已写 4.00 GB，已录 00:04:00", "rec:1001")   # 刷新第一个
-    log(app, "[1001] 未开播，30 秒后再拉一次")                    # 普通日志不动
+    # 等待开播也是「进度型」，但 key 不同 —— 不能把「已写」那一行挤掉
+    for i in range(2):
+        log(app, f"[1001] 当前主播未直播，30 秒后再拉一次（已等 {i * 30}s，一直等）",
+            "wait:1001")
 
     lines = txt.get("1.0", "end-1c").splitlines()
     txt.destroy()
@@ -81,15 +84,16 @@ def test_console_single_line() -> None:
 
     n1 = [ln for ln in lines if "[1001] 已写" in ln]
     n2 = [ln for ln in lines if "[1002] 已写" in ln]
+    nw = [ln for ln in lines if "秒后再拉一次" in ln]
     assert len(n1) == 1, lines                       # 一个直播间只留一条
     assert "4.00 GB" in n1[0] and "00:04:00" in n1[0], n1
     assert len(n2) == 1 and "9.00 GB" in n2[0], n2    # 别的直播间互不影响
+    assert len(nw) == 1 and "已等 30s" in nw[0], nw    # 等待提示也只留最新一条
     assert lines[0].endswith("开场白"), lines          # 普通日志一条不少
-    assert any("未开播" in ln for ln in lines), lines
 
     # 文件日志是全量（含被控制台删掉的那些进度和等待日志）
     assert sum("已写" in t for t in FILE_LINES) == 5, FILE_LINES
-    assert any("未开播" in t for t in FILE_LINES), FILE_LINES
+    assert sum("秒后再拉一次" in t for t in FILE_LINES) == 2, FILE_LINES
 
 
 def main() -> int:

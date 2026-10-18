@@ -754,20 +754,29 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
     #      a.wait > 0 最多等这么久；a.wait == 0 一直等；a.wait < 0 不等
     streams = fetch_room_streams(rid, cookie=load_cookie())
     waited = 0
+    wait_logged = False
     while not streams.live and a.wait >= 0:
         if a.wait and waited >= a.wait:
             break
         if stop_event.is_set():
             log("已取消等待开播")
             return None
+        # live=房间号：同一个直播间的等待提示在界面里只留一条（就地刷新等待时长），
+        # logs/gui.log 仍然每 30 秒记一条，方便事后看它到底等了多久。
         log(f"{streams.error or '未开播'}，{WAIT_INTERVAL} 秒后再拉一次"
             + (f"（已等 {fmt_dur(waited)}，上限 {fmt_dur(a.wait)}）" if a.wait
-               else f"（已等 {fmt_dur(waited)}，一直等）"))
+               else f"（已等 {fmt_dur(waited)}，一直等）"),
+            live=f"wait:{rid}")
+        wait_logged = True
         if stop_event.wait(WAIT_INTERVAL):        # 可被立刻打断的 sleep
             log("已取消等待开播")
             return None
         waited += WAIT_INTERVAL
         streams = fetch_room_streams(rid, cookie=load_cookie())
+
+    if streams.live and wait_logged:
+        # 等到了：用同一行改写成「开播了」，别让界面上一直挂着「未开播（已等 3 小时）」
+        log(f"主播开播了（等了 {fmt_dur(waited)}）", live=f"wait:{rid}")
 
     if not streams.live:
         reason = streams.error or "当前主播未直播"
