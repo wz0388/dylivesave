@@ -207,6 +207,10 @@ recordings/
 ```
 
 - **断流会自动重连**，重连后写 `_part2.ts`，不覆盖前面的。
+- **断流卡死有看门狗**：断流时 ffmpeg 不一定退出（TCP 半开连接会一直卡在 read 上），
+  文件不长了、进程还在 —— 看着就是「一直在录，这一段永远不结束，也永远不投稿」。
+  所以录制线程自己盯着输出文件：**60 秒没有新数据**就判定断流，主动收掉 ffmpeg 去重连；
+  主播真下播了就正常退出，把最后一段交出去投稿。
 - 切到新的一段时，用**新段的开始时间**重新起名，所以文件名本身就能看出分段。
 - 拉流地址带 `expire`/`sign` 会失效，所以长录制用的是「取地址 → 录 → 断了再取新地址」的循环；
   切段时也会顺手重取一次。
@@ -395,7 +399,7 @@ B 站要求封面必填且不接受空字符串，所以这帧是必须抽的；
 | `record_gui.json` / `logs/` | 界面设置与日志（**不进仓库**） |
 | `bili_failed_uploads.json` | 投稿失败待补传的清单（**不进仓库**） |
 | `bili_sessions.json` | 场次 → 稿件（bvid）对照表：同一场直播的分片靠它追加成同一个视频的分P（**不进仓库**） |
-| `tests/` | 分P 归属 / 删除开关 / 进度日志 / 每行分段时间的离线自测（不联网、不真传）：`tests/test_multipart.py`、`test_uploader_queue.py`、`test_delete_after_upload.py`、`test_live_log.py`、`test_row_segment.py` |
+| `tests/` | 分P 归属 / 删除开关 / 进度日志 / 每行分段时间 / 断流看门狗的离线自测（不联网、不真传）：`tests/test_multipart.py`、`test_uploader_queue.py`、`test_delete_after_upload.py`、`test_live_log.py`、`test_row_segment.py`、`test_stall_watchdog.py` |
 
 ### 关于 cookie.txt
 

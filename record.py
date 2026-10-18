@@ -62,6 +62,11 @@ QUALITY_DESC = {"FULL_HD1": "原画/高清", "ORIGIN": "原画", "HD1": "高清"
 
 #: 未开播时的重试间隔（秒）
 WAIT_INTERVAL = 30
+#: 录制中「多久没新数据就认为断流了」（秒）。
+#: 断流时 ffmpeg 不一定退出：连接半开的话它会一直卡在 read 上，文件不长了但进程还在，
+#: 表现就是「一直在录、这一段的文件永远不结束」—— 靠这个阈值主动收掉它去重连。
+#: 设得太小会把主播自己的卡顿误判成断流（重连代价很小，只是多开一个分P）。
+STALL_SECONDS = 60
 #: 给没传 stop_event 的调用方用的哑对象（永远不置位）
 _NEVER_SET = threading.Event()
 
@@ -868,17 +873,35 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
             seg_start = time.time()
             proc = subprocess.Popen(cmd, creationflags=flags)
             last_report = time.time()
+            last_size = -1
+            last_growth = time.time()
+            stalled = False
             while proc.poll() is None:
                 time.sleep(1)
                 if (deadline and time.time() >= deadline) or stop_event.is_set():
                     stopped = True
                     break
-                if time.time() - last_report >= 15 and os.path.exists(out):
+                try:
+                    cur_size = os.path.getsize(out) if os.path.exists(out) else 0
+                except OSError:
+                    cur_size = 0
+                if cur_size != last_size:
+                    last_size = cur_size
+                    last_growth = time.time()
+                elif time.time() - last_growth >= STALL_SECONDS:
+                    # 断流时 ffmpeg 不一定退出：连接半开的话它会一直卡在 read 上，
+                    # 文件不再增长、进程也不结束 —— 不主动收掉就会「永远在录」，
+                    # 最后这一段既不会结束也投不上去。所以自己盯着「有没有新数据」。
+                    stalled = True
+                    log(f"[!] {STALL_SECONDS} 秒没有新数据（断流了？），"
+                        "主动结束这一段去重连")
+                    break
+                if time.time() - last_report >= 15 and cur_size:
                     # live=房间号：界面里这个房间的「已写」只留一条，就地刷新
-                    log(f"  已写 {human(os.path.getsize(out))}，已录 {fmt_hms(time.time() - seg_start)}",
+                    log(f"  已写 {human(cur_size)}，已录 {fmt_hms(time.time() - seg_start)}",
                         live=f"rec:{rid}")
                     last_report = time.time()
-            if proc.poll() is None:          # 到点了，让它收尾
+            if proc.poll() is None:          # 到点了 / 停止了 / 卡住了，让它收尾
                 try:
                     if os.name == "nt":
                         proc.send_signal(signal.CTRL_BREAK_EVENT)
@@ -925,7 +948,7 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
                 log("已录满指定时长，停止")
                 break
 
-            if rc == 0 and not too_short:
+            if rc == 0 and not too_short and not stalled:
                 log("录制结束（流已结束）")
                 break
             if a.no_reconnect:
@@ -936,6 +959,8 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
                 if protocol == "hls":     # hls 拉不到就回退 flv，抖音的 flv 直连更稳
                     protocol = "flv"
                     log("切换到 flv 协议重试")
+            elif stalled:
+                log(f"{STALL_SECONDS} 秒没有新数据，按断流处理；5 秒后重连 …")
             else:
                 log(f"ffmpeg 退出码 {rc}，可能是断流；5 秒后重连 …")
             time.sleep(5)
