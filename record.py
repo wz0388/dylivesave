@@ -67,6 +67,9 @@ WAIT_INTERVAL = 30
 #: 表现就是「一直在录、这一段的文件永远不结束」—— 靠这个阈值主动收掉它去重连。
 #: 设得太小会把主播自己的卡顿误判成断流（重连代价很小，只是多开一个分P）。
 STALL_SECONDS = 60
+#: 上一场录制结束多久内又开播，算**同一场直播**（内容接着投进同一个稿件）。
+#: 抖音偶尔会闪断重推流：下播几秒后又「开播」，其实是同一场 —— 分成两个视频就断片了。
+SESSION_JOIN_GAP = 180
 #: 给没传 stop_event 的调用方用的哑对象（永远不置位）
 _NEVER_SET = threading.Event()
 
@@ -238,18 +241,25 @@ class LiveSession:
     """一场直播 = B 站上的一个稿件，这场直播的每个分片是它的 P1/P2/P3…
 
     判定「是不是同一场」只看录制循环：一次连续的录制（开播 → 下播/停止）就是一场。
-    下播之后主播再开播，run_one_room 会重新进一次录制循环 —— 那是**新的一场**，
-    投成**新稿件**，不会被追加到上一场那个视频里。
+    **例外**：上一次录制刚结束不久（SESSION_JOIN_GAP，默认 3 分钟）主播又开播了，
+    那多半是同一次直播抖了一下（断流、闪断重推流），这时会 resume 上一场 ——
+    沿用同一个 key 和开播时间，内容接着投进**同一个稿件**，不再新建一个视频。
 
     key 用「房间号-开播时间」，既区分不同主播，也区分同一主播的不同场次；
     bvid 由后台上传队列写回来（bili_uploader.upload_recording），后续分片靠它追加分P。
     """
 
-    def __init__(self, rid, start=None):
-        self.start = start or datetime.now()
-        self.key = f"{rid}-{self.start:%Y%m%d_%H%M%S}"
+    def __init__(self, rid, start=None, resume=None):
+        """resume: 上一场的 {"key", "start", "bvid"}，给了就接着它（不新建场次）。"""
+        resume = resume or {}
+        self.start = resume.get("start") or start or datetime.now()
+        self.key = resume.get("key") or f"{rid}-{self.start:%Y%m%d_%H%M%S}"
+        self.resumed = bool(resume.get("key"))
         self.state = {"key": self.key, "start": self.start, "rid": str(rid),
-                      "bvid": None, "aid": 0, "parts": 0}
+                      "bvid": resume.get("bvid"), "aid": int(resume.get("aid") or 0),
+                      "parts": 0}
+        # 分P 号只是「从第几个P 起」的提示：追加时真正按稿件现有分P 数往后排，
+        # 所以接着上一场时从 1 数也没问题。
         self.next_part = 1
 
     @property
@@ -264,6 +274,32 @@ class LiveSession:
 
     def __repr__(self):
         return f"<LiveSession {self.key} bvid={self.bvid}>"
+
+
+#: 每个直播间「上一场」的收尾信息：rid -> {"key", "start", "bvid", "ended"}
+_LAST_SESSIONS: dict[str, dict] = {}
+
+
+def resume_hint(rid, gap=None):
+    """这一场要不要接着上一场、投进同一个稿件？要就返回上一场的信息，否则 None。
+
+    判据只有一个：**上一场结束到现在不到 gap 秒**（默认 SESSION_JOIN_GAP = 3 分钟）。
+    抖音的「下播 → 1 秒后又开播」基本都是闪断重推流，按新的一场处理会在 B 站
+    多出一个只有几十秒的碎片视频，观众那边看就是断成两截。
+    """
+    gap = SESSION_JOIN_GAP if gap is None else gap
+    prev = _LAST_SESSIONS.get(str(rid))
+    if not prev:
+        return None
+    if time.time() - float(prev.get("ended") or 0) > gap:
+        return None
+    return prev
+
+
+def remember_last_session(rid, session, ended_at) -> None:
+    """记下这一场的收尾信息，给 resume_hint() 用。"""
+    _LAST_SESSIONS[str(rid)] = {"key": session.key, "start": session.start,
+                                "bvid": session.bvid, "ended": float(ended_at)}
 
 
 class UploadWorker:
@@ -810,9 +846,15 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
 
     # 这一场直播 = 一个 B 站稿件：本场所有的分段都投成它的 P1/P2/P3…
     # 下播后再开播会重新进一次 run_recording，那是新的一场 → 新稿件。
-    session = LiveSession(rid)
-    log(f"本场直播：{session.key}（同一场的分片会投成同一个稿件的分P，"
-        "关播再开播算新的一场）")
+    resume = resume_hint(rid)
+    session = LiveSession(rid, resume=resume)
+    if resume:
+        log(f"本场直播：{session.key} —— 距上一场结束不到 "
+            f"{fmt_dur(SESSION_JOIN_GAP)}，算**同一场**，内容接着投进同一个稿件"
+            + (f"（{resume.get('bvid')}）" if resume.get("bvid") else "（稿件号等上传队列认）"))
+    else:
+        log(f"本场直播：{session.key}（同一场的分片会投成同一个稿件的分P，"
+            f"关播 {fmt_dur(SESSION_JOIN_GAP)} 内再开播也算同一场）")
 
     # ---- 录制：断流自动重连 + 按 --segment 分段（默认 2 小时一段）
     deadline = time.time() + a.duration if a.duration > 0 else None
@@ -976,6 +1018,7 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
     except KeyboardInterrupt:
         log("收到 Ctrl+C，正在收尾 …")
 
+    ended_at = time.time()      # 流真正结束的时刻（3 分钟内再开播要合并成同一场）
     log("")
     if not files:
         log("没有录到任何文件")
@@ -1027,6 +1070,7 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
                        live_title=streams.title, quality=quality, ffmpeg=ffmpeg,
                        config_path=a.bili_config, force=a.bili, no_bili=a.no_bili,
                        logf=logf)
+    remember_last_session(rid, session, ended_at)
     return {"segments": segments, "files": files, "anchor": streams.anchor,
             "session": session.key, "bvid": session.bvid}
 
