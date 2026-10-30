@@ -359,13 +359,20 @@ delete_after_upload = false    # true = 投稿成功后删除本地录制文件
 > ⚠️ 删了找不回来。B 站上的稿件在审核期间不公开，如果你需要本地留档
 > （或者怕审核不过），就保持 `false`。
 
-### 不管合集
+### 合集（可选，每个主播单独设）
 
-投稿只管把视频投上去，**不自动归到合集**。要归档到合集，事后跑 `bili_season.py`：
+界面每行有个 **「合集」** 按钮：点一下会把账号下的**所有合集**读出来（可搜索），
+挑一个之后，这个主播的每一场**新视频投上去就自动加进这个合集**；点「清空（不加合集）」就不加。
 
-```bash
-python bili_season.py add --season 合集名 --latest     # 把最新稿件放进指定合集
-```
+- 加合集是**视频投上去之后**单独发一次请求，失败**不影响投稿本身**
+  （视频已经在 B 站上了，只是没进合集），日志会写清楚原因；
+- 稿件还在审核时加合集多半会被拒 —— 会自动记进 `bili_season_pending.json`，
+  下次投稿（或下次程序开始投稿）时自动再试，最多 8 次；
+- 只有**新建稿件**时会加一次；后面追加分P 不会重复加（视频已经在合集里了）；
+- 选择跟着主播行存在 `record_gui.json` 里，重启还在。命令行没有这个开关。
+
+> 原理：B 站加视频是加到合集的**小节**（section，默认那个叫「正片」）上，
+> 所以拉列表时会把每个合集的第一个 `section_id` 一起记下来再提交。
 
 ### 封面统一取第一帧
 
@@ -409,8 +416,9 @@ B 站要求封面必填且不接受空字符串，所以这帧是必须抽的；
 | `bili_credential.json` | B 站登录态（**不进仓库**） |
 | `record_gui.json` / `logs/` | 界面设置与日志（**不进仓库**） |
 | `bili_failed_uploads.json` | 投稿失败待补传的清单（**不进仓库**） |
+| `bili_season_pending.json` | 待加合集的稿件清单（审核中加不进去的会留在这儿重试，**不进仓库**） |
 | `bili_sessions.json` | 场次 → 稿件（bvid）对照表：同一场直播的分片靠它追加成同一个视频的分P（**不进仓库**） |
-| `tests/` | 分P 归属 / 删除开关 / 进度日志 / 每行分段时间 / 断流看门狗的离线自测（不联网、不真传）：`tests/test_multipart.py`、`test_uploader_queue.py`、`test_delete_after_upload.py`、`test_live_log.py`、`test_row_segment.py`、`test_stall_watchdog.py` |
+| `tests/` | 分P 归属 / 删除开关 / 进度日志 / 每行分段时间 / 断流看门狗 / 合集的离线自测（不联网、不真传）：`tests/test_multipart.py`、`test_uploader_queue.py`、`test_delete_after_upload.py`、`test_live_log.py`、`test_row_segment.py`、`test_stall_watchdog.py`、`test_season.py` |
 
 ### 关于 cookie.txt
 

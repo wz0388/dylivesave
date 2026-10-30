@@ -25,10 +25,10 @@ CALLS: list[dict] = []
 
 def _fake_upload(files, *, anchor, cfg, room_id="", live_title="", quality="",
                  ffmpeg="ffmpeg", when=None, seg_index=1, seg_total=1, log=print,
-                 progress=None, session=None, part=0):
+                 progress=None, session=None, part=0, season=None):
     CALLS.append({"files": [Path(f).name for f in files],
                   "session": (session or {}).get("key"),
-                  "part": part})
+                  "part": part, "season": season})
     if session is not None:
         session["bvid"] = "BV1FROMQUEUE"
     return {"bvid": "BV1FROMQUEUE", "appended": False, "pages": 1}
@@ -60,8 +60,14 @@ def main() -> int:
         w.submit({"start": datetime(2026, 10, 17, 20, 0), "files": [str(f)]},
                  rid="1001", anchor="主播A", live_title="直播标题", quality="FULL_HD1",
                  ffmpeg="ffmpeg", session=s1.state, part=s1.take_parts(1))
+    # 合集也要跟着段一路传下去（界面每行选的那个）
+    w.submit({"start": datetime(2026, 10, 17, 20, 0), "files": [str(f2)]},
+             rid="1001", anchor="主播A", live_title="直播标题", quality="FULL_HD1",
+             ffmpeg="ffmpeg", session=s1.state, part=s1.take_parts(1),
+             season={"id": 111, "title": "直播回放", "section_id": 222})
     assert w.wait(20), "队列没跑完"
-    assert [c["part"] for c in CALLS] == [1, 2], CALLS
+    assert [c["part"] for c in CALLS] == [1, 2, 3], CALLS
+    assert CALLS[-1]["season"] == {"id": 111, "title": "直播回放", "section_id": 222}, CALLS[-1]
     assert {c["session"] for c in CALLS} == {s1.key}, CALLS
     assert s1.bvid == "BV1FROMQUEUE", s1
 

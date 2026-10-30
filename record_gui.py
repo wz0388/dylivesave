@@ -279,7 +279,8 @@ class RecorderApp:
         self._check_login()
 
     # ─────────────────── 主播行 ───────────────────
-    def add_row(self, room: str = "", quality: str = "", segment: str = "") -> dict:
+    def add_row(self, room: str = "", quality: str = "", segment: str = "",
+                season=None) -> dict:
         idx = len(self.rows) + 1
         f = ttk.Frame(self.rows_frame)
         f.pack(fill="x", pady=2)
@@ -305,8 +306,15 @@ class RecorderApp:
 
         row = {"frame": f, "no": lbl_no, "room": var_room, "quality": var_q,
                "segment": var_s, "seg_combo": scb,
+               "season": season if isinstance(season, dict) else None,
                "entry": e, "combo": cb, "thread": None, "stop": None,
                "running": False, "rid": "", "_tag": ""}
+
+        # 合集：点一下从账号里所有合集里挑一个，投稿成功后自动加进去
+        b_season = ttk.Button(f, text=self._season_text(row["season"]), width=10,
+                              command=lambda r=row: self.pick_season(r))
+        b_season.pack(side="left", padx=(0, 4))
+        row["btn_season"] = b_season
 
         b_start = ttk.Button(f, text="开始", width=5,
                              command=lambda r=row: self.start_row(r))
@@ -325,6 +333,112 @@ class RecorderApp:
         self.rows.append(row)
         self._sync_state()
         return row
+
+    @staticmethod
+    def _season_text(season) -> str:
+        """合集按钮上的字：没选就写「合集」，选了显示合集名（太长截一下）。"""
+        if not season:
+            return "合集"
+        t = str((season or {}).get("title") or "").strip()
+        return (t[:5] + "…") if len(t) > 5 else (t or "合集")
+
+    def pick_season(self, row: dict) -> None:
+        """选这个主播要自动加入的合集：拉账号下所有合集，让用户挑一个。"""
+        cfg, _ = bu.load_config()
+        cred = bu.read_credential(cfg.cred_file) or {}
+        if not str(cred.get("sessdata") or "").strip():
+            messagebox.showwarning("还没登录 B 站",
+                                   "先点「B 站扫码登录」，才能读到你的合集列表")
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("选择合集")
+        win.geometry("520x460")
+        win.transient(self.root)
+        win.grab_set()
+
+        ttk.Label(win, text="这个主播投稿成功后，新视频自动加进所选合集。",
+                  foreground="#666").pack(anchor="w", padx=12, pady=(10, 2))
+        cur = row.get("season") or {}
+        lbl_cur = ttk.Label(win, text=("当前：" + (cur.get("title") or "未选择")),
+                            font=("Microsoft YaHei UI", 9, "bold"))
+        lbl_cur.pack(anchor="w", padx=12)
+
+        search = tk.StringVar()
+        ent = ttk.Entry(win, textvariable=search)
+        ent.pack(fill="x", padx=12, pady=(8, 4))
+
+        box = ttk.Frame(win)
+        box.pack(fill="both", expand=True, padx=12)
+        tv = ttk.Treeview(box, columns=("title", "count"), show="headings",
+                          height=12, selectmode="browse")
+        for c, w, t in (("title", 330, "合集"), ("count", 90, "视频数")):
+            tv.heading(c, text=t)
+            tv.column(c, width=w, anchor="w" if c == "title" else "center")
+        sb = ttk.Scrollbar(box, command=tv.yview)
+        tv.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        tv.pack(side="left", fill="both", expand=True)
+
+        status = ttk.Label(win, text="正在读取合集列表…", foreground="#666")
+        status.pack(anchor="w", padx=12, pady=(4, 0))
+
+        state = {"items": []}
+
+        def fill(*_):
+            kw = search.get().strip()
+            tv.delete(*tv.get_children())
+            for it in state["items"]:
+                if kw and kw not in it["title"]:
+                    continue
+                tv.insert("", "end", iid=str(it["id"]),
+                          values=(it["title"] or f"（无标题 {it['id']}）", it["count"]))
+
+        def reload_seasons():
+            status.configure(text="正在读取合集列表…", foreground="#666")
+            win.update_idletasks()
+            try:
+                state["items"] = bu.list_seasons(cred)
+            except Exception as e:
+                status.configure(text=f"读取失败：{e}", foreground="#b45309")
+                return
+            fill()
+            status.configure(text=f"共 {len(state['items'])} 个合集（输入可筛选）",
+                             foreground="#666")
+
+        def apply_choice():
+            sel = tv.selection()
+            if not sel:
+                messagebox.showinfo("还没选", "先在上面的列表里点一个合集", parent=win)
+                return
+            sid = int(sel[0])
+            item = next((i for i in state["items"] if i["id"] == sid), None)
+            if not item:
+                return
+            row["season"] = item
+            row["btn_season"].configure(text=self._season_text(item))
+            self.append_log(f"[i] 合集已设置：{item['title']}（id={sid}，"
+                            f"投稿成功后自动加入）")
+            self._save_settings()
+            win.destroy()
+
+        def clear_choice():
+            row["season"] = None
+            row["btn_season"].configure(text=self._season_text(None))
+            self.append_log("[i] 合集已清空：这个主播的视频不再自动加入合集")
+            self._save_settings()
+            win.destroy()
+
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=12, pady=10)
+        ttk.Button(btns, text="加入这个合集", command=apply_choice).pack(side="left")
+        ttk.Button(btns, text="清空（不加合集）", command=clear_choice).pack(side="left", padx=8)
+        ttk.Button(btns, text="刷新", command=reload_seasons).pack(side="left")
+        ttk.Button(btns, text="取消", command=win.destroy).pack(side="right")
+
+        search.trace_add("write", fill)
+        tv.bind("<Double-1>", lambda e: apply_choice())
+        reload_seasons()
 
     def del_row(self, row: dict) -> None:
         """删除一行。**录制中也能删** —— 只停这一路，其它主播不受影响。"""
@@ -356,7 +470,8 @@ class RecorderApp:
         # 先恢复「默认分段时间」：add_row 建行时拿它当兜底
         self.var_segment.set(_segment_label(d.get("segment", SEGMENT_DEFAULT)))
         for r in rooms or [{}]:
-            self.add_row(r.get("room", ""), r.get("quality", ""), r.get("segment", ""))
+            self.add_row(r.get("room", ""), r.get("quality", ""),
+                         r.get("segment", ""), r.get("season"))
         if not self.rows:
             self.add_row()
         self.var_duration.set(d.get("duration", DURATION_CHOICES[0][0]))
@@ -371,7 +486,8 @@ class RecorderApp:
             SETTINGS.write_text(json.dumps({
                 "rooms": [{"room": r["room"].get().strip(),
                            "quality": r["quality"].get(),
-                           "segment": r["segment"].get()}
+                           "segment": r["segment"].get(),
+                           "season": r.get("season")}
                           for r in self.rows],
                 "segment": self.var_segment.get(),
                 "duration": self.var_duration.get(),
@@ -715,6 +831,7 @@ class RecorderApp:
                 uploader=self._ensure_uploader(), stop_event=row["stop"],
                 quality=self._quality_code(row["quality"].get()),
                 segment=self._segment_seconds(row["segment"].get()),
+                season=row.get("season"),
                 duration=self._duration_seconds(),
                 out_dir=str(out_dir), wait=self._wait_seconds(), upload=True,
                 monitor=self.var_monitor.get()))

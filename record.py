@@ -368,6 +368,15 @@ class UploadWorker:
                 self.log(f"[!] 没检查出 B 站登录态（{detail}）—— 网络原因不拦，继续上传")
             else:
                 self.log(f"[√] B 站登录态正常：{detail}")
+                # 上次没加进合集的稿件（多半是当时还在审核）—— 这时候顺手补一次
+                try:
+                    import bili_uploader as bu
+                    n = bu.retry_pending_seasons(
+                        bu.read_credential(self._cfg.cred_file) or {}, self.log)
+                    if n:
+                        self.log(f"[i] 之前没加进合集的稿件，补加了 {n} 个")
+                except Exception:
+                    pass
         return self._enabled
 
     # ---- 队列
@@ -379,12 +388,13 @@ class UploadWorker:
         self._thread.start()
 
     def submit(self, seg: dict, *, rid, anchor, live_title, quality, ffmpeg,
-               session=None, part=1) -> None:
+               session=None, part=1, season=None) -> None:
         """把一个录完的分段交给后台上传（立刻返回，不阻塞录制）。
 
         session: 这一场直播的状态（LiveSession.state）。传了且 bili.toml 里
                  multi_part = true 时，同一场的每一段都会追加成**同一个稿件**的分P。
         part:    这一段从第几个分P 起算（1 起）。
+        season:  建稿成功后要加入的合集（这个主播选的），追加分P 时不再重复加。
         """
         files = list(seg.get("files") or [])
         if not files:
@@ -398,7 +408,7 @@ class UploadWorker:
                         quality=quality, ffmpeg=ffmpeg,
                         session=session,
                         session_key=str((session or {}).get("key") or ""),
-                        part=int(part or 0)))
+                        part=int(part or 0), season=season))
         self.start()
         extra = ""
         if session:
@@ -494,6 +504,7 @@ class UploadWorker:
                 when=item["start"], seg_index=item["seq"], seg_total=0,
                 log=self.log, session=item.get("session"),
                 part=int(item.get("part") or 0),
+                season=item.get("season"),
                 progress=lambda pct, d, t: self._notify(
                     item["seq"], "progress", pct, "", d, t, label))
         except Exception as e:
@@ -744,7 +755,7 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
                   out_dir=None, name="", ffmpeg="", wait=0, no_reconnect=False,
                   list_only=False, upload=True, bili_config="", force_bili=False,
                   no_bili=False, logf=None, stop_event=None,
-                  uploader=None, tag=""):
+                  uploader=None, tag="", season=None):
     """录制一个直播间，录完（可选）自动投稿。
 
     命令行和 GUI 共用这一份逻辑：
@@ -757,6 +768,7 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
       upload       录完是否投稿（还要看 bili.toml 里的 enabled）
       uploader     给了就在**每段录完的当下**交给后台上传（录制不等它）；
                    不传则退回「整场录完再一起传」
+      season       这个主播选的合集（{"id","title","section_id"}）；建稿成功后自动加进去
 
     投稿粒度：**一次调用 = 一场直播 = 一个 B 站稿件**。这次调用里切出来的每一段
     都是该稿件的分P（P1/P2/…）；下播后主播再开播由 run_one_room 重新调一次本函数，
@@ -889,7 +901,7 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
             uploader.submit(seg, rid=rid, anchor=streams.anchor,
                             live_title=streams.title, quality=quality,
                             ffmpeg=ffmpeg, session=session.state,
-                            part=session.take_parts(n))
+                            part=session.take_parts(n), season=season)
         else:
             end_upload.append(seg)
 

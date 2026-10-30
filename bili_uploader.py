@@ -795,6 +795,196 @@ def make_session(room_id: str, start: datetime) -> dict:
             "rid": str(room_id), "bvid": None, "aid": 0, "parts": 0}
 
 
+# ─────────────────── 合集（season） ───────────────────
+# 投稿成功后把视频塞进用户指定的合集。接口都在创作中心域下，只认 cookie + csrf：
+#   拉合集列表：GET  member.bilibili.com/x2/creative/web/seasons
+#   加视频    ：POST member.bilibili.com/x2/creative/web/season/section/episodes/add
+# ⚠️ 加视频加的是**小节**（section），不是合集本身 —— 合集默认那个小节叫「正片」，
+#    所以选合集时要把它的第一个 section_id 一起带上。
+SEASON_LIST_URL = "https://member.bilibili.com/x2/creative/web/seasons"
+SEASON_ADD_URL = ("https://member.bilibili.com/x2/creative/web/season/"
+                  "section/episodes/add")
+ARCHIVE_VIEW_URL = "https://member.bilibili.com/x/vupre/web/archive/view"
+PUBLIC_VIEW_URL = "https://api.bilibili.com/x/web-interface/view"
+#: 这次加不进合集（多半是稿件还在审核）就先记下来，下次投稿/补传时再试
+PENDING_SEASON_FILE = "bili_season_pending.json"
+
+
+def _member_cookies(cred) -> dict:
+    """Credential 对象或凭据 dict → 真名 cookie（SESSDATA / bili_jct …）。"""
+    if isinstance(cred, dict):
+        d = cred
+    else:
+        d = {k: getattr(cred, k, "") for k in _COOKIE_NAMES}
+    return {_COOKIE_NAMES[k]: str(d.get(k)).strip()
+            for k in _COOKIE_NAMES if str(d.get(k) or "").strip()}
+
+
+def _member_headers() -> dict:
+    return {"User-Agent": UA, "Referer":
+            "https://member.bilibili.com/platform/upload/video/frame",
+            "Origin": "https://member.bilibili.com"}
+
+
+def list_seasons(cred) -> list[dict]:
+    """账号下的所有合集。
+
+    每项：{id, title, count, section_id, section_title}
+    （section_id 是「正片」那个小节的 id，加视频时必须带）
+    """
+    seasons: list[dict] = []
+    pn = 1
+    while pn <= 20:                      # 最多 600 个，够用；防死循环
+        r = requests.get(SEASON_LIST_URL,
+                         params={"pn": pn, "ps": 30, "order": "ctime", "sort": "desc"},
+                         cookies=_member_cookies(cred), headers=_member_headers(),
+                         timeout=20)
+        try:
+            payload = r.json()
+        except Exception as e:
+            raise BiliError(f"合集列表返回的不是 JSON（HTTP {r.status_code}）：{e}") from e
+        if payload.get("code") != 0:
+            raise BiliError(f"拉合集列表失败：code={payload.get('code')} "
+                            f"{payload.get('message') or ''}".strip())
+        items = ((payload.get("data") or {}).get("seasons")) or []
+        for it in items:
+            meta = it.get("season") or it
+            secs = ((it.get("sections") or {}).get("sections")) or []
+            seasons.append({
+                "id": int(meta.get("id") or 0),
+                "title": meta.get("title") or "",
+                "count": int(meta.get("epCount") or meta.get("ep_count") or 0),
+                "section_id": int(secs[0].get("id") or 0) if secs else 0,
+                "section_title": (secs[0].get("title") or "") if secs else "",
+            })
+        if len(items) < 30:
+            break
+        pn += 1
+    return seasons
+
+
+def _archive_ids(bvid: str, cred) -> tuple[int, int]:
+    """拿稿件的 aid 和第一个分P 的 cid（加合集要这两个）。
+
+    先用创作中心接口（自己的稿件，审核中也能查到），不行再退公开接口。
+    """
+    try:
+        r = requests.get(ARCHIVE_VIEW_URL, params={"bvid": bvid},
+                         cookies=_member_cookies(cred), headers=_member_headers(),
+                         timeout=20)
+        d = (r.json() or {}).get("data") or {}
+        aid = int((d.get("archive") or {}).get("aid") or 0)
+        vids = d.get("videos") or []
+        cid = int((vids[0] or {}).get("cid") or 0) if vids else 0
+        if aid and cid:
+            return aid, cid
+    except Exception:
+        pass
+    r = requests.get(PUBLIC_VIEW_URL, params={"bvid": bvid},
+                     cookies=_member_cookies(cred), headers=_member_headers(), timeout=20)
+    d = (r.json() or {}).get("data") or {}
+    aid = int(d.get("aid") or 0)
+    pages = d.get("pages") or []
+    cid = int((pages[0] or {}).get("cid") or 0) if pages else 0
+    if not (aid and cid):
+        raise BiliError("拿不到稿件的 aid / cid（稿件还在审核中？）")
+    return aid, cid
+
+
+def add_video_to_season(bvid: str, season: dict | int, cred, title: str = "") -> str:
+    """把稿件加进合集，返回合集名（给日志用）。
+
+    season 可以是 picker 里存的 {"id","title","section_id"}，也可以只给合集 id
+    （那就现查一遍列表找它的小节）。
+    """
+    sid, name = 0, ""
+    if isinstance(season, dict):
+        sid = int(season.get("section_id") or 0)
+        name = season.get("title") or ""
+        target = int(season.get("id") or 0)
+    else:
+        target = int(season or 0)
+    if not sid:
+        for s in list_seasons(cred):
+            if s["id"] == target:
+                sid, name = int(s["section_id"] or 0), s["title"] or name
+                break
+    if not sid:
+        raise BiliError(f"合集 {target} 没有可用的小节（section），没法往里加视频")
+
+    aid, cid = _archive_ids(bvid, cred)
+    jct = _member_cookies(cred).get("bili_jct") or ""
+    body = {"sectionId": int(sid),
+            "episodes": [{"aid": aid, "cid": cid,
+                          "title": (title or bvid)[:80], "charging_pay": 0}]}
+    r = requests.post(f"{SEASON_ADD_URL}?csrf={jct}", json=body,
+                      cookies=_member_cookies(cred), headers=_member_headers(),
+                      timeout=25)
+    try:
+        payload = r.json()
+    except Exception as e:
+        raise BiliError(f"加合集返回的不是 JSON（HTTP {r.status_code}）：{e}") from e
+    if payload.get("code") != 0:
+        raise BiliError(f"加入合集失败：code={payload.get('code')} "
+                        f"{payload.get('message') or ''}".strip())
+    return name or f"合集 {target}"
+
+
+def pending_season_path() -> Path:
+    return APP_DIR / PENDING_SEASON_FILE
+
+
+def load_pending_seasons() -> list[dict]:
+    try:
+        d = json.loads(pending_season_path().read_text(encoding="utf-8"))
+        return d if isinstance(d, list) else []
+    except Exception:
+        return []
+
+
+def _save_pending_seasons(items: list[dict]) -> None:
+    try:
+        pending_season_path().write_text(
+            json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def remember_pending_season(bvid: str, season, title: str = "", error: str = "") -> None:
+    """这次没加进合集（多半是稿件还在审核）—— 记下来，下次再试。"""
+    items = [it for it in load_pending_seasons()
+             if not (it.get("bvid") == bvid and it.get("season") == season)]
+    items.append({"bvid": bvid, "season": season, "title": title,
+                  "error": error, "tries": 0,
+                  "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+    _save_pending_seasons(items)
+
+
+def retry_pending_seasons(cred, log: Callable = print) -> int:
+    """把之前没加进合集的稿件再试一遍，返回成功数。"""
+    items = load_pending_seasons()
+    if not items:
+        return 0
+    left: list[dict] = []
+    done = 0
+    for it in items:
+        try:
+            name = add_video_to_season(it.get("bvid") or "", it.get("season"),
+                                       cred, it.get("title") or "")
+            done += 1
+            log(f"[√] 补加合集成功：{it.get('bvid')} → 《{name}》")
+        except Exception as e:
+            it["error"] = f"{type(e).__name__}: {e}"
+            it["tries"] = int(it.get("tries") or 0) + 1
+            it["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if it["tries"] < 8:
+                left.append(it)
+            else:
+                log(f"[!] 加合集连续失败，先放弃：{it.get('bvid')}（{it['error']}）")
+    _save_pending_seasons(left)
+    return done
+
+
 # ─────────────────── 投稿 ───────────────────
 async def _pick_client():
     """确认 bilibili_api 真的能拿到 HTTP 客户端（它自己不带，靠第三方库）。
@@ -1079,6 +1269,7 @@ def upload_recording(
     progress: Callable | None = None,
     session: dict | None = None,
     part: int = 0,
+    season: dict | int | None = None,
 ) -> dict | None:
     """把**一段录制文件**交上去：这场直播还没投过就建新稿，投过了就追加成分P。
 
@@ -1091,6 +1282,8 @@ def upload_recording(
                · 还没建过稿 → 建一个新稿，并把 bvid 写回 session / bili_sessions.json。
              不传或 cfg.multi_part 为假 → 老行为，每次调用都是独立稿件。
     part: 这一段从第几个分P 起算（0 = 只用于日志，实际按稿件现有分P数算）。
+    season: 建稿成功后要加入的合集（{"id","title","section_id"} 或合集 id）。
+            只在**新建稿件**时加一次；追加分P 时视频已经在合集里了，不会重复加。
 
     progress(pct, done_chunks, total_chunks)：上传进度回调（给界面用）。
 
@@ -1282,6 +1475,18 @@ def upload_recording(
                          aid=session["aid"], title=title, anchor=anchor)
     log(f"[√] 投稿完成：https://www.bilibili.com/video/{bvid}")
     log("    稿件需审核通过后才会公开。")
+    if season:
+        # 视频已经投上去了，加合集是「锦上添花」：失败不影响投稿，记下来下次再试
+        try:
+            sname = add_video_to_season(bvid, season, cred, title)
+            log(f"[√] 已加入合集《{sname}》")
+        except Exception as e:
+            log(f"[!] 加入合集失败（视频已经投上去了，不影响）：{e}")
+            log("    已记到待加合集清单，下次投稿/补传时会自动再试")
+            try:
+                remember_pending_season(bvid, season, title, f"{type(e).__name__}: {e}")
+            except Exception:
+                pass
     delete_uploaded(usable + made_mp4, cfg, log)         # 上传成功才删
     return {"bvid": bvid, "appended": False, "pages": len(to_upload)}
 
