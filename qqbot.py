@@ -24,6 +24,7 @@ import asyncio
 import json
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -60,6 +61,15 @@ class BotConfig:
     notify_upload_ok: bool = True
     notify_upload_fail: bool = True
     prefix: str = "#"
+    #: 绑定码：openid 拿不到，让用户在群里/私聊里发「#绑定 <码>」，就知道该往哪发了
+    bind_code: str = ""
+
+
+def ensure_bind_code(cfg: BotConfig) -> str:
+    """没有绑定码就生成一个（uuid4，形如 620ba1cb-3ed4-...）。"""
+    if not (cfg.bind_code or "").strip():
+        cfg.bind_code = str(uuid.uuid4())
+    return cfg.bind_code
 
 
 def config_path(app_dir: Path) -> Path:
@@ -97,7 +107,12 @@ class QQBot:
 
     def __init__(self, cfg: BotConfig, *, log: Callable[[str], None] = print,
                  handler: Callable[[str, str, str], str] | None = None,
-                 on_status: Callable[[str], None] | None = None):
+                 on_status: Callable[[str], None] | None = None,
+                 on_bind: Callable[[str, str], str] | None = None,
+                 on_unbind: Callable[[str, str], str] | None = None):
+        ensure_bind_code(cfg)
+        self.on_bind = on_bind
+        self.on_unbind = on_unbind
         self.cfg = cfg
         self.log = log
         self.handler = handler
@@ -337,7 +352,7 @@ class QQBot:
             await self._reply(target, at + "发「" + pref + "帮助」看看能做什么", d)
             return
 
-        reply = self._run_command(text, user)
+        reply = self._run_command(text, user, target)
         self.stats["commands"] += 1
         await self._reply(target, at + reply, d)
 
@@ -351,23 +366,46 @@ class QQBot:
             self._seen.popitem(last=False)
         return False
 
-    def _run_command(self, text: str, user: str) -> str:
+    def _run_command(self, text: str, user: str, target=("group", "")) -> str:
         """解析指令 → 权限检查 → handler。返回给用户的一句话。"""
         parts = text.split()
         cmd = parts[0]
         arg = " ".join(parts[1:]).strip()
         aliases = {"add": "添加", "del": "删除", "remove": "删除", "ls": "列表",
-                   "list": "列表", "status": "状态", "help": "帮助", "?": "帮助"}
+                   "list": "列表", "status": "状态", "help": "帮助", "?": "帮助",
+                   "bind": "绑定", "unbind": "解绑"}
         cmd = aliases.get(cmd.lower(), cmd)
+        p = self.cfg.prefix or "#"
 
         if cmd in ("帮助", "help"):
-            p = self.cfg.prefix or "#"
             return ("可用指令：\n"
                     f"{p}列表 —— 看现在在录哪些主播\n"
                     f"{p}状态 —— 录制/上传概况\n"
                     f"{p}添加 房间号 [清晰度] —— 添加主播\n"
                     f"{p}删除 房间号 —— 删除主播\n"
+                    f"{p}绑定 绑定码 —— 把通知发到这里（码在电脑端面板）\n"
+                    f"{p}解绑 —— 不再往这里发\n"
                     f"{p}帮助 —— 就是这条")
+
+        # ---- 绑定：openid 拿不到，就让用户把这个码发到群里/私聊里，发到哪儿就绑哪儿
+        if cmd in ("绑定", ):
+            code = arg.strip()
+            if not code:
+                return f"用法：{p}绑定 绑定码（在电脑端「机器人」页复制）"
+            if code.lower() != (self.cfg.bind_code or "").lower():
+                return "绑定码不对，去电脑端面板复制最新那个"
+            if self.on_bind is None:
+                return "界面没接上，绑不了"
+            kind, oid = target
+            if not oid:
+                return "拿不到这个会话的 openid，绑定失败"
+            return self.on_bind(kind, oid)
+
+        if cmd in ("解绑", ):
+            if self.on_unbind is None:
+                return "界面没接上"
+            kind, oid = target
+            return self.on_unbind(kind, oid)
 
         if cmd in ("列表", "状态"):
             if self.handler is None:

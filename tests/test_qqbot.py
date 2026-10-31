@@ -124,10 +124,51 @@ def main() -> int:
     assert b.sent[0][0] == "/v2/groups/G1/messages"
     assert "msg_id" not in b.sent[0][1], b.sent[0][1]
 
+    # ---- 10b. 绑定码：openid 抄不到，靠 #绑定 <码> 让机器人自己记下来
+    b = make_bot()
+    bound = []
+
+    def _bind(kind, oid):
+        bound.append((kind, oid))
+        return f"绑定成功（{kind}）"
+    b.on_bind = _bind
+    assert qb.ensure_bind_code(b.cfg) == b.cfg.bind_code != ""
+    assert "#绑定" in b._run_command("帮助", "U1")
+
+    # 码不对 → 拒绝，什么都不记
+    assert "绑定码不对" in b._run_command("绑定 0000", "U1", ("group", "G1"))
+    assert bound == []
+
+    # 群里绑定 → 记成 group/G1
+    good = b.cfg.bind_code
+    r = b._run_command(f"绑定 {good}", "U1", ("group", "G1"))
+    assert r.startswith("绑定成功") and bound == [("group", "G1")], (r, bound)
+
+    # 私聊绑定 → 记成 user/U1
+    bound.clear()
+    b._run_command(f"绑定 {good}", "U1", ("user", "U1"))
+    assert bound == [("user", "U1")], bound
+
+    # 关掉「允许操作」也能绑定（绑定不算管理操作）
+    b2 = make_bot(allow_manage=False)
+    seen = []
+    b2.on_bind = lambda kind, oid: (seen.append((kind, oid)), "ok")[1]
+    b2._run_command(f"绑定 {b2.cfg.bind_code}", "U1", ("group", "G2"))
+    assert seen == [("group", "G2")], seen
+
+    # 解绑
+    un = []
+    b2.on_unbind = lambda kind, oid: (un.append((kind, oid)), "已解绑")[1]
+    assert "已解绑" in b2._run_command("解绑", "U1", ("group", "G2"))
+    assert un == [("group", "G2")]
+
+    # 没给码 → 只提示用法
+    assert "用法" in b2._run_command("绑定", "U1", ("group", "G2"))
+
     # ---- 11. 界面侧：机器人指令真的能加/删主播
     test_gui()
 
-    print("OK：指令解析/权限/@与前缀触发/被动回复/去重/主动通知/界面增删主播 全部通过")
+    print("OK：指令解析/权限/@与前缀触发/被动回复/去重/主动通知/绑定码/界面增删主播 全部通过")
     return 0
 
 
@@ -139,6 +180,9 @@ def test_gui() -> None:
 
     app = QApplication.instance() or QApplication([])
     g.SETTINGS = Path(tempfile.mkdtemp()) / "record_gui.json"
+    # 绑定会把 openid 写进 APP_DIR/qqbot.json —— 测试跑完清掉，别污染真实配置
+    cfg_file = qb.config_path(g.APP_DIR)
+    existed = cfg_file.exists()
     w = g.MainWindow()
     try:
         assert w.bot is None, "默认没启用机器人"
@@ -159,8 +203,20 @@ def test_gui() -> None:
 
         assert "没找到" in w._bot_command_ui("删除", "999", "u1")
         assert "个主播" in w._bot_command_ui("状态", "", "u1")
+
+        # 绑定码：面板上有码，收到 #绑定 后 openid 自动填进配置
+        code = w.ed_code.text()
+        assert len(code) == 36 and code.count("-") == 4, code
+        r = w._on_bind_ui("group", "GROUP_OPENID_1")
+        assert "绑定成功" in r and "GROUP_OPENID_1" in w.ed_groups.text(), r
+        r = w._on_bind_ui("user", "USER_OPENID_1")
+        assert "绑定成功" in r and "USER_OPENID_1" in w.ed_users.text(), r
+        assert w._on_unbind_ui("group", "GROUP_OPENID_1") == "已解绑，不再往这里发通知"
+        assert "GROUP_OPENID_1" not in w.ed_groups.text()
     finally:
         w.close()
+        if not existed and cfg_file.exists():
+            cfg_file.unlink()
 
 
 if __name__ == "__main__":

@@ -722,6 +722,26 @@ class MainWindow(FluentWindow):
         h2.addWidget(self.ed_users, 1)
         lay.addWidget(r2)
 
+        # --- 绑定码：openid 抄不到，就发这条指令过去，发哪儿绑哪儿
+        r2b = QWidget(card)
+        h2b = QHBoxLayout(r2b)
+        h2b.setContentsMargins(0, 0, 0, 0)
+        h2b.setSpacing(10)
+        l6 = BodyLabel("绑定码")
+        l6.setFixedWidth(76)
+        h2b.addWidget(l6)
+        self.ed_code = LineEdit()
+        self.ed_code.setReadOnly(True)
+        h2b.addWidget(self.ed_code, 1)
+        self.btn_copy = PushButton("复制指令", r2b)
+        self.btn_copy.setToolTip("复制「#绑定 <绑定码>」，粘到群里或私聊发给机器人")
+        self.btn_copy.clicked.connect(self._copy_bind_cmd)
+        h2b.addWidget(self.btn_copy)
+        self.btn_newcode = PushButton("重新生成", r2b)
+        self.btn_newcode.clicked.connect(self._regen_code)
+        h2b.addWidget(self.btn_newcode)
+        lay.addWidget(r2b)
+
         # --- 谁能操作
         r3 = QWidget(card)
         h3 = QHBoxLayout(r3)
@@ -772,9 +792,9 @@ class MainWindow(FluentWindow):
         lay.addWidget(r5)
 
         lay.addWidget(CaptionLabel(
-            "用法：把机器人拉进群，在群里 @它 发「#添加 房间号」「#删除 房间号」"
-            "「#列表」「#状态」。通知走主动消息，第一次先让机器人在群里收到一条消息，"
-            "把群 openid 抄到上面。"))
+            "绑定：把机器人拉进群（或加好友），把「#绑定 绑定码」发过去 —— "
+            "在群里发就绑到群，私聊发就绑到私聊，上面的 openid 会自动填好。\n"
+            "管理：再发「#添加 房间号」「#删除 房间号」「#列表」「#状态」。"))
 
     def _load_bot_ui(self) -> None:
         c = self.bot_cfg
@@ -790,6 +810,7 @@ class MainWindow(FluentWindow):
         self.ck_live_off.setChecked(c.notify_live_off)
         self.ck_up_ok.setChecked(c.notify_upload_ok)
         self.ck_up_fail.setChecked(c.notify_upload_fail)
+        self.ed_code.setText(qb.ensure_bind_code(c))
         self.sw_bot.blockSignals(False)
 
     @staticmethod
@@ -845,9 +866,67 @@ class MainWindow(FluentWindow):
             return
         self.bot = qb.QQBot(cfg, log=lambda t: self.bridge.botlog.emit(t),
                             handler=self._bot_command,
+                            on_bind=self._on_bind, on_unbind=self._on_unbind,
                             on_status=lambda s: self.bridge.botlog.emit(f"[状态] {s}"))
         self.bot.start()
         self.lbl_bot_state.setText("启动中…")
+
+    def _copy_bind_cmd(self) -> None:
+        code = self.ed_code.text().strip() or qb.ensure_bind_code(self.bot_cfg)
+        QApplication.clipboard().setText(f"#绑定 {code}")
+        InfoBar.success("已复制", f"把这句发到群里或私聊： #绑定 {code}",
+                        duration=4000, position=InfoBarPosition.TOP, parent=self)
+
+    def _regen_code(self) -> None:
+        import uuid
+        self.bot_cfg.bind_code = str(uuid.uuid4())
+        self.ed_code.setText(self.bot_cfg.bind_code)
+        try:
+            qb.save_config(APP_DIR, self._read_bot_ui())
+        except Exception:
+            pass
+        self.append_log("[i] 绑定码已重新生成（旧的作废）")
+
+    def _on_bind(self, kind: str, oid: str) -> str:
+        """机器人在群里/私聊里收到「#绑定 <码>」→ 回 GUI 线程记下来。"""
+        return self._ui_call(lambda: self._on_bind_ui(kind, oid))
+
+    def _on_bind_ui(self, kind: str, oid: str) -> str:
+        c = self.bot_cfg
+        if kind == "group":
+            if oid not in c.groups:
+                c.groups.append(oid)
+            where = "这个群"
+        else:
+            if oid not in c.users:
+                c.users.append(oid)
+            where = "这个私聊"
+        self.ed_groups.setText("，".join(c.groups))
+        self.ed_users.setText("，".join(c.users))
+        try:
+            qb.save_config(APP_DIR, self._read_bot_ui())
+        except Exception:
+            pass
+        self.append_log(f"[QQ] 已绑定{where}：{oid}")
+        return f"绑定成功，以后的开播/投稿通知都发到{where}"
+
+    def _on_unbind(self, kind: str, oid: str) -> str:
+        return self._ui_call(lambda: self._on_unbind_ui(kind, oid))
+
+    def _on_unbind_ui(self, kind: str, oid: str) -> str:
+        c = self.bot_cfg
+        lst = c.groups if kind == "group" else c.users
+        if oid not in lst:
+            return "这里本来就没绑过"
+        lst.remove(oid)
+        self.ed_groups.setText("，".join(c.groups))
+        self.ed_users.setText("，".join(c.users))
+        try:
+            qb.save_config(APP_DIR, self._read_bot_ui())
+        except Exception:
+            pass
+        self.append_log(f"[QQ] 已解绑：{oid}")
+        return "已解绑，不再往这里发通知"
 
     def _on_bot_log(self, text: str) -> None:
         if text.startswith("[状态] "):
