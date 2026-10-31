@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-抖音直播录制 → B 站自动投稿 · 图形界面
+抖音直播录制 → B 站自动投稿 · 图形界面（CustomTkinter）
 ------------------------------------------------------------------
 双击 exe 或 `python record_gui.py` 打开。界面只负责收集参数和显示日志，
 真正的录制/投稿逻辑全部复用 record.run_recording()，和命令行是同一份代码。
 
+界面用 CustomTkinter（圆角卡片 / 扁平按钮 / 深浅色），配色统一走 C() 调色板，
+不要在各处写死颜色 —— 主题一切换所有控件都要跟着走。
+
 要点：
   · **多个主播可以同时录**：每个主播一个后台线程，互不影响；
     日志前面带 `[房间号]` 前缀，分得清是谁的。
-  · **分段一录完就上传**：交给后台上传队列，录制线程立刻接着录下一段 ——
-    不会因为上传（投稿失败要退避重试）把录制卡住。
-    同一场直播的各段追加成**同一个视频的 P1/P2/P3…**，关播再开播才另起一个视频。
+  · **分段一录完就上传**：交给后台上传队列，录制线程立刻接着录下一段。
   · 未开播时按设定每 30 秒重试一次拉流（默认一直等，直到开播或点停止）。
-  · 录完自动投稿是否开启，界面里能改（配置见 bili.toml；不管合集）。
 """
 import json
 import os
@@ -22,32 +22,10 @@ import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, font as tkfont, messagebox, ttk
+from tkinter import filedialog, messagebox
 
-# Sun Valley 主题（Win11 风格）：装上就用，没装也能跑（只是回到 ttk 默认外观）
-try:
-    import sv_ttk
-    HAS_THEME = True
-except Exception:                                    # pragma: no cover
-    sv_ttk = None
-    HAS_THEME = False
+import customtkinter as ctk
 
-#: 深色 / 浅色。界面里的提示文字、状态色都从这里取，别在别处写死颜色。
-DARK = False
-
-_PALETTE = {
-    "light": {"muted": "#6b7280", "ok": "#15803d", "warn": "#b45309",
-              "err": "#b91c1c", "log_bg": "#fafafa", "log_fg": "#374151",
-              "accent": "#0f766e"},
-    "dark": {"muted": "#9aa0a6", "ok": "#5cd39a", "warn": "#fbbf24",
-             "err": "#f87171", "log_bg": "#1c1c22", "log_fg": "#e6e6e6",
-             "accent": "#7dd3c8"},
-}
-
-
-def C(key: str) -> str:
-    """取当前主题下的颜色。"""
-    return _PALETTE["dark" if DARK else "light"].get(key, "#000000")
 
 # 打包成 exe 后，工作目录可能是任意位置；配置和日志按 exe / 脚本所在目录找
 def app_dir() -> Path:
@@ -63,11 +41,27 @@ if str(APP_DIR) not in sys.path:
 import record as rec                                    # noqa: E402
 import bili_uploader as bu                              # noqa: E402
 
+#: 界面设置（每个主播行、目录、主题…）
 SETTINGS = APP_DIR / "record_gui.json"
+
+FONT = "Microsoft YaHei UI"
+MONO = "Consolas"
 
 QUALITY_CHOICES = ["FULL_HD1", "ORIGIN", "HD1", "SD1", "SD2", "LD", "auto"]
 QUALITY_LABEL = {"FULL_HD1": "原画/高清（推荐）", "ORIGIN": "原画", "HD1": "高清",
                  "SD1": "标清", "SD2": "较低", "LD": "流畅", "auto": "自动挑最好的"}
+SEGMENT_CHOICES = [("30 分钟", 1800), ("60 分钟", 3600),
+                   ("120 分钟（推荐）", 7200), ("不分段", 0)]
+#: 默认分段时间（2 小时，和命令行 --segment 7200 一致）
+SEGMENT_DEFAULT = SEGMENT_CHOICES[2][0]
+#: 老版本界面存下来的标签 → 秒数（换过选项文案，读旧设置时要翻译一下）
+_SEGMENT_LEGACY = {"1 小时": 3600, "2 小时（推荐）": 7200, "3 小时": 10800,
+                   "6 小时": 21600}
+DURATION_CHOICES = [("不限（一直录到主播下播）", 0), ("1 小时", 3600),
+                    ("2 小时", 7200), ("4 小时", 14400), ("6 小时", 21600),
+                    ("8 小时", 28800), ("12 小时", 43200)]
+
+
 def _quality_label(saved: str) -> str:
     """存下来的清晰度 → 下拉框里那行字。
 
@@ -83,19 +77,8 @@ def _quality_label(saved: str) -> str:
     return QUALITY_LABEL[QUALITY_CHOICES[0]]
 
 
-SEGMENT_CHOICES = [("30 分钟", 1800), ("60 分钟", 3600),
-                   ("120 分钟（推荐）", 7200), ("不分段", 0)]
-#: 默认分段时间（2 小时，和命令行 --segment 7200 一致）
-SEGMENT_DEFAULT = SEGMENT_CHOICES[2][0]
-#: 老版本界面存下来的标签 → 秒数（换过选项文案，读旧设置时要翻译一下）
-_SEGMENT_LEGACY = {"2 小时（推荐）": 7200, "1 小时": 3600, "3 小时": 10800,
-                   "6 小时": 21600, "不分段": 0}
-DURATION_CHOICES = [("一直录到手动停止", 0), ("30 分钟", 1800), ("1 小时", 3600),
-                    ("2 小时", 7200), ("6 小时", 21600)]
-
-
 def _segment_label(saved: str = "") -> str:
-    """把设置里存的「分段时间」翻译成当前选项的文案。
+    """分段时间下拉框的文案。老的 "2 小时（推荐）" 按秒数对到现在的选项上。
 
     选项改过（以前是 1/2/3/6 小时），老配置里的 "2 小时（推荐）" 现在不在列表里，
     直接塞进只读下拉框会显示不出东西 —— 这里按秒数对回去，对不上就用默认值。
@@ -108,6 +91,38 @@ def _segment_label(saved: str = "") -> str:
         if s == sec:
             return label
     return SEGMENT_DEFAULT
+
+
+# ─────────────────── 外观 ───────────────────
+#: 深色 / 浅色。CTk 的颜色都是 (浅色, 深色) 元组，切换外观时控件自己会跟着变；
+#: 只有 Text 的 tag 颜色、进度条这类要手动重刷，用 C1() 取当前模式下的具体值。
+DARK = False
+
+_PALETTE = {
+    "card": ("#ffffff", "#1e1e22"),
+    "card2": ("#f7f8fa", "#232329"),
+    "muted": ("#6b7280", "#9aa0a6"),
+    "ok": ("#15803d", "#5cd39a"),
+    "warn": ("#b45309", "#fbbf24"),
+    "err": ("#b91c1c", "#f87171"),
+    "sub": ("#e8eaed", "#2a2a30"),
+    "sub_hover": ("#dfe2e6", "#33333a"),
+    "sub_text": ("#111827", "#e6e6e6"),
+    "log_bg": ("#fafafa", "#17171b"),
+    "log_fg": ("#374151", "#e6e6e6"),
+    "border": ("#dcdfe4", "#33333a"),
+}
+
+
+def C(key: str):
+    """当前调色板里的颜色（元组 → 自动跟随深浅色）。"""
+    return _PALETTE.get(key, ("#000000", "#ffffff"))
+
+
+def C1(key: str) -> str:
+    """当前模式下的具体颜色（给 tag / 画布这种不吃元组的地方用）。"""
+    light, dark = C(key)
+    return dark if DARK else light
 
 
 def open_in_explorer(path: Path) -> None:
@@ -138,7 +153,7 @@ def file_log(text: str) -> None:
 
 
 class RecorderApp:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: ctk.CTk):
         self.root = root
         self.q: queue.Queue = queue.Queue()
         self.stop_event = threading.Event()
@@ -146,187 +161,221 @@ class RecorderApp:
         self.uploader: rec.UploadWorker | None = None
         self.recording = False
         self.rows: list[dict] = []
+        self.up_rows: dict[str, dict] = {}     # 上传页的卡片行
         self._nrun = 0
         self._up_pct = 0
         self._up_chunks = ""
         self._mon: threading.Thread | None = None
-        self._qr_img = None                  # 防止二维码图片被 GC
-        self._login_win = None               # 登录弹窗 / 里面的控件（主线程才碰）
+        self._qr_img = None                    # 防止二维码图片被 GC
+        self._login_win = None                 # 登录弹窗 / 里面的控件（主线程才碰）
         self._qr_lbl = None
         self._qr_hint = None
-        self.dark = False                    # 深色主题（设置里存，重启还在）
-        self._themed: list[tuple] = []       # 静态提示标签：切主题时要重新上色
+        self.dark = False                      # 深色（设置里存，重启还在）
 
         root.title("抖音直播录制 → B 站投稿")
-        root.geometry("1000x760")
-        root.minsize(920, 640)
-        if HAS_THEME:
-            sv_ttk.set_theme("light")
+        root.minsize(940, 700)
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        w, h = 1020, min(860, max(700, sh - 150))
+        root.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 2 - 40)}")
+        root.configure(fg_color=("#f4f5f7", "#141416"))
+        ctk.set_default_color_theme("blue")
+        ctk.set_appearance_mode("light")
 
         self._build_ui()
         self._load_settings()
-        self._apply_theme(self.dark)         # 按设置里的深浅色重上一遍色
+        self._apply_theme(self.dark)           # 按设置里的深浅色重上一遍
         self._sync_state()
 
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.after(150, self._drain_queue)
-        try:                                  # 真正生效的主题名（sv-ttk 没装上会是 vista / xpnative）
-            _theme_now = ttk.Style().theme_use()
-        except Exception:
-            _theme_now = "?"
         file_log(f"界面启动 pid={os.getpid()} frozen={getattr(sys, 'frozen', False)} "
-                 f"dir={APP_DIR} 主题={_theme_now}")
+                 f"dir={APP_DIR} 主题={'dark' if DARK else 'light'} ui=ctk")
 
     # ─────────────────── 界面 ───────────────────
+    def _card(self, parent, title: str):
+        """圆角卡片 + 一行小标题，返回放内容的容器。"""
+        card = ctk.CTkFrame(parent, corner_radius=14, fg_color=C("card"))
+        card.pack(fill="x", padx=14, pady=4)
+        ctk.CTkLabel(card, text=title, font=(FONT, 11, "bold"),
+                     text_color=C("muted"), anchor="w").pack(
+            fill="x", padx=14, pady=(8, 0))
+        body = ctk.CTkFrame(card, fg_color="transparent")
+        body.pack(fill="x", padx=10, pady=(0, 8))
+        return body
+
+    def _sub_btn(self, parent, text, command=None, width=88, height=30):
+        """次要按钮（灰底）—— 主操作用默认的蓝色强调按钮。"""
+        return ctk.CTkButton(parent, text=text, command=command, width=width,
+                             height=height, corner_radius=8, font=(FONT, 11),
+                             fg_color=C("sub"), hover_color=C("sub_hover"),
+                             text_color=C("sub_text"))
+
     def _build_ui(self) -> None:
-        pad = {"padx": 6, "pady": 4}
+        # ---- 顶部标题
+        head = ctk.CTkFrame(self.root, fg_color="transparent")
+        head.pack(fill="x", padx=18, pady=(14, 2))
+        ctk.CTkLabel(head, text="抖音直播录制", font=(FONT, 19, "bold"),
+                     anchor="w").pack(side="left")
+        ctk.CTkLabel(head, text="  →  B 站自动投稿", font=(FONT, 13),
+                     text_color=C("muted")).pack(side="left")
+        self.btn_theme = self._sub_btn(head, "深色", self._toggle_theme, width=64)
+        self.btn_theme.pack(side="right")
 
         # ---- 主播列表
-        rooms_box = ttk.LabelFrame(self.root, text="主播（可以填多个，同时开录）")
-        rooms_box.pack(fill="x", padx=10, pady=(10, 6))
-        self.rows_frame = ttk.Frame(rooms_box)
-        self.rows_frame.pack(fill="x", padx=4, pady=4)
-        btn_row = ttk.Frame(rooms_box)
-        btn_row.pack(fill="x", padx=4, pady=(0, 6))
-        self.btn_add = ttk.Button(btn_row, text="+ 添加主播", command=self.add_row)
+        rooms = self._card(self.root, "主播 · 可以多个同时录制")
+        self.rows_frame = ctk.CTkFrame(rooms, fg_color="transparent")
+        self.rows_frame.pack(fill="x")
+        btn_row = ctk.CTkFrame(rooms, fg_color="transparent")
+        btn_row.pack(fill="x", pady=(6, 0))
+        self.btn_add = self._sub_btn(btn_row, "+ 添加主播", self.add_row, width=108)
         self.btn_add.pack(side="left")
 
         # ---- 公共设置
-        top = ttk.LabelFrame(self.root, text="公共设置")
-        top.pack(fill="x", padx=10, pady=6)
+        top = self._card(self.root, "公共设置")
         top.columnconfigure(1, weight=1)
         top.columnconfigure(3, weight=1)
 
-        ttk.Label(top, text="分段时间（默认）").grid(row=0, column=0, sticky="e", **pad)
+        ctk.CTkLabel(top, text="分段时间（默认）", font=(FONT, 12),
+                     text_color=C("muted"), anchor="e", width=104).grid(
+            row=0, column=0, sticky="e", padx=(4, 6), pady=4)
         self.var_segment = tk.StringVar(value=SEGMENT_DEFAULT)
-        ttk.Combobox(top, textvariable=self.var_segment, state="readonly",
-                     values=[s[0] for s in SEGMENT_CHOICES]).grid(row=0, column=1,
-                                                                 sticky="ew", **pad)
-        ttk.Label(top, text="录制时长").grid(row=0, column=2, sticky="e", **pad)
-        self.var_duration = tk.StringVar(value=DURATION_CHOICES[0][0])
-        ttk.Combobox(top, textvariable=self.var_duration, state="readonly",
-                     values=[d[0] for d in DURATION_CHOICES]).grid(row=0, column=3,
-                                                                   sticky="ew", **pad)
+        ctk.CTkOptionMenu(top, variable=self.var_segment, values=[s[0] for s in SEGMENT_CHOICES],
+                          height=32, corner_radius=8, font=(FONT, 12),
+                          fg_color=C("sub"), button_color=C("sub_hover"),
+                          text_color=C("sub_text")).grid(
+            row=0, column=1, sticky="ew", padx=6, pady=4)
 
-        ttk.Label(top, text="输出目录").grid(row=1, column=0, sticky="e", **pad)
+        ctk.CTkLabel(top, text="录制时长", font=(FONT, 12), text_color=C("muted"),
+                     anchor="e", width=72).grid(row=0, column=2, sticky="e",
+                                                padx=(10, 6), pady=4)
+        self.var_duration = tk.StringVar(value=DURATION_CHOICES[0][0])
+        ctk.CTkOptionMenu(top, variable=self.var_duration,
+                          values=[d[0] for d in DURATION_CHOICES],
+                          height=32, corner_radius=8, font=(FONT, 12),
+                          fg_color=C("sub"), button_color=C("sub_hover"),
+                          text_color=C("sub_text")).grid(
+            row=0, column=3, sticky="ew", padx=6, pady=4)
+
+        ctk.CTkLabel(top, text="输出目录", font=(FONT, 12), text_color=C("muted"),
+                     anchor="e", width=104).grid(row=1, column=0, sticky="e",
+                                                 padx=(4, 6), pady=4)
         self.var_dir = tk.StringVar(value=str(rec.DEFAULT_DIR))
-        f = ttk.Frame(top)
-        f.grid(row=1, column=1, columnspan=3, sticky="ew", **pad)
+        f = ctk.CTkFrame(top, fg_color="transparent")
+        f.grid(row=1, column=1, columnspan=3, sticky="ew", padx=6, pady=4)
         f.columnconfigure(0, weight=1)
-        ttk.Entry(f, textvariable=self.var_dir).grid(row=0, column=0, sticky="ew")
-        ttk.Button(f, text="浏览", width=6, command=self.pick_dir).grid(row=0, column=1,
-                                                                        padx=(4, 0))
+        ctk.CTkEntry(f, textvariable=self.var_dir, height=32, corner_radius=8,
+                     font=(FONT, 12)).grid(row=0, column=0, sticky="ew")
+        self._sub_btn(f, "浏览", self.pick_dir, width=64, height=32).grid(
+            row=0, column=1, padx=(6, 0))
 
         # ---- 未开播时的行为
-        wait_box = ttk.LabelFrame(self.root, text="主播没开播时")
-        wait_box.pack(fill="x", padx=10, pady=6)
+        wait = self._card(self.root, "主播没开播时")
         self.var_wait_mode = tk.StringVar(value="forever")
-        ttk.Radiobutton(wait_box, text="一直等（每 30 秒重试一次拉流）",
-                        variable=self.var_wait_mode,
-                        value="forever").pack(side="left", padx=8, pady=4)
-        ttk.Radiobutton(wait_box, text="最多等", variable=self.var_wait_mode,
-                        value="limit").pack(side="left", padx=(8, 2), pady=4)
+        r1 = ctk.CTkFrame(wait, fg_color="transparent")
+        r1.pack(fill="x")
+        ctk.CTkRadioButton(r1, text="一直等（每 30 秒重试一次拉流）",
+                           variable=self.var_wait_mode, value="forever",
+                           font=(FONT, 12), radiobutton_width=16,
+                           radiobutton_height=16).pack(side="left", padx=(4, 14))
+        ctk.CTkRadioButton(r1, text="最多等", variable=self.var_wait_mode,
+                           value="limit", font=(FONT, 12), radiobutton_width=16,
+                           radiobutton_height=16).pack(side="left")
         self.var_wait_min = tk.StringVar(value="30")
-        ttk.Entry(wait_box, textvariable=self.var_wait_min, width=5).pack(side="left",
-                                                                          pady=4)
-        ttk.Label(wait_box, text="分钟").pack(side="left", padx=(2, 12))
-        ttk.Radiobutton(wait_box, text="没开播就直接结束", variable=self.var_wait_mode,
-                        value="none").pack(side="left", padx=8, pady=4)
+        ctk.CTkEntry(r1, textvariable=self.var_wait_min, width=56, height=28,
+                     corner_radius=8, font=(FONT, 12)).pack(side="left", padx=6)
+        ctk.CTkLabel(r1, text="分钟", font=(FONT, 12), text_color=C("muted")).pack(
+            side="left", padx=(0, 16))
+        ctk.CTkRadioButton(r1, text="没开播就直接结束", variable=self.var_wait_mode,
+                           value="none", font=(FONT, 12), radiobutton_width=16,
+                           radiobutton_height=16).pack(side="left")
         self.var_monitor = tk.BooleanVar(value=True)
-        ttk.Checkbutton(wait_box,
-                        text="下播后继续监控：每 30 秒查一次，开播自动接着录",
-                        variable=self.var_monitor).pack(anchor="w", padx=8, pady=(0, 4))
+        ctk.CTkCheckBox(r1, text="下播后继续监控（开播自动接着录）",
+                        variable=self.var_monitor, font=(FONT, 11),
+                        checkbox_width=18, checkbox_height=18,
+                        corner_radius=4).pack(side="right")
 
         # ---- 投稿
-        bili_box = ttk.LabelFrame(self.root, text="B 站投稿")
-        bili_box.pack(fill="x", padx=10, pady=6)
-
-        row1 = ttk.Frame(bili_box)
+        bili = self._card(self.root, "B 站投稿")
+        row1 = ctk.CTkFrame(bili, fg_color="transparent")
         row1.pack(fill="x")
         self.var_upload = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row1, text="分段录完就自动投稿（同一场直播投成一个视频的分P）",
-                        variable=self.var_upload).pack(side="left", padx=8, pady=4)
-        self.lbl_login = ttk.Label(row1, text="登录状态：未检查", foreground=C("muted"))
-        self.lbl_login.pack(side="left", padx=(16, 8))
-        ttk.Button(row1, text="B 站扫码登录", command=self.open_login).pack(
-            side="right", padx=8, pady=4)
-        ttk.Button(row1, text="编辑配置", command=self.edit_bili_config).pack(
-            side="right", pady=4)
-        ttk.Button(row1, text="补传", command=self.fix_uploads).pack(
-            side="right", padx=8, pady=4)
+        ctk.CTkCheckBox(row1, text="分段录完就自动投稿（同一场直播投成一个视频的分P）",
+                        variable=self.var_upload, font=(FONT, 12),
+                        checkbox_width=18, checkbox_height=18,
+                        corner_radius=4).pack(side="left", pady=2)
+        self.lbl_login = ctk.CTkLabel(row1, text="登录状态：未检查", font=(FONT, 12),
+                                      text_color=C("muted"))
+        self.lbl_login.pack(side="left", padx=14)
+        ctk.CTkButton(row1, text="B 站扫码登录", command=self.open_login, width=112,
+                      height=30, corner_radius=8, font=(FONT, 11)).pack(side="right")
+        self._sub_btn(row1, "编辑配置", self.edit_bili_config).pack(side="right", padx=6)
+        self._sub_btn(row1, "补传", self.fix_uploads, width=64).pack(side="right")
 
-        row2 = ttk.Frame(bili_box)
-        row2.pack(fill="x")
+        row2 = ctk.CTkFrame(bili, fg_color="transparent")
+        row2.pack(fill="x", pady=(6, 0))
         # 开关写在 bili.toml 的 [bili].delete_after_upload（GUI 和命令行共用同一份配置）
         self.var_delete = tk.BooleanVar(value=False)
-        ttk.Checkbutton(row2, text="上传成功后删除本地视频（省硬盘，删了找不回来）",
-                        variable=self.var_delete,
-                        command=self.on_toggle_delete).pack(side="left", padx=8,
-                                                            pady=(0, 4))
-        ttk.Label(row2, text="只删确认上传成功的那几个文件；没传上去的会留着补传",
-                  foreground=C("muted")).pack(side="left", padx=(6, 8), pady=(0, 4))
+        ctk.CTkCheckBox(row2, text="上传成功后删除本地视频（省硬盘，删了找不回来）",
+                        variable=self.var_delete, command=self.on_toggle_delete,
+                        font=(FONT, 12), checkbox_width=18, checkbox_height=18,
+                        corner_radius=4).pack(side="left", pady=2)
+        ctk.CTkLabel(row2, text="只删确认上传成功的那几个文件；没传上去的会留着补传",
+                     font=(FONT, 11), text_color=C("muted")).pack(side="left", padx=(12, 4))
 
         # ---- 操作区
-        bar = ttk.Frame(self.root)
-        bar.pack(fill="x", padx=10, pady=(2, 6))
-        self.btn_start = ttk.Button(
-            bar, text="全部开始", command=self.on_start,
-            style=("Accent.TButton" if HAS_THEME else None))
+        bar = ctk.CTkFrame(self.root, fg_color="transparent")
+        bar.pack(fill="x", padx=18, pady=(8, 4))
+        self.btn_start = ctk.CTkButton(bar, text="全部开始", command=self.on_start,
+                                       width=104, height=36, corner_radius=10,
+                                       font=(FONT, 13, "bold"))
         self.btn_start.pack(side="left")
-        self.btn_stop = ttk.Button(bar, text="全部停止", command=self.on_stop)
-        self.btn_stop.pack(side="left", padx=8)
-        ttk.Button(bar, text="打开录制目录",
-                   command=lambda: open_in_explorer(Path(self.var_dir.get()))).pack(
-            side="left", padx=8)
-        self.lbl_status = ttk.Label(bar, text="● 就绪", font=("Microsoft YaHei UI", 10))
+        self.btn_stop = self._sub_btn(bar, "全部停止", self.on_stop, width=104, height=36)
+        self.btn_stop.pack(side="left", padx=10)
+        self._sub_btn(bar, "打开录制目录",
+                      lambda: open_in_explorer(Path(self.var_dir.get())),
+                      width=116, height=36).pack(side="left")
+        self.lbl_status = ctk.CTkLabel(bar, text="● 就绪", font=(FONT, 12),
+                                       text_color=C("muted"))
         self.lbl_status.pack(side="right")
-        self.btn_theme = ttk.Button(bar, text="深色", width=6,
-                                    command=self._toggle_theme)
-        self.btn_theme.pack(side="right", padx=(0, 10))
 
         # ---- 日志 / 上传（分页）
-        nb = ttk.Notebook(self.root)
-        nb.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-        self.nb = nb
+        self.nb = ctk.CTkTabview(self.root, corner_radius=14, fg_color=C("card"),
+                                 height=220, anchor="w",
+                                 segmented_button_fg_color=C("card2"),
+                                 segmented_button_selected_color=("#2563eb", "#2f6f6a"),
+                                 segmented_button_selected_hover_color=("#1d4ed8", "#3a8280"),
+                                 text_color=C("sub_text"))
+        self.nb.pack(fill="both", expand=True, padx=14, pady=(4, 14))
+        tab_rec = self.nb.add("录制日志")
+        tab_up = self.nb.add("上传")
 
         # 分页 1：录制日志（多人同时录时，看开头的房间号区分）
-        tab_rec = ttk.Frame(nb)
-        nb.add(tab_rec, text=" 录制日志 ")
-        self.txt = tk.Text(tab_rec, height=14, wrap="none", state="disabled",
-                           background=C("log_bg"), relief="flat")
-        sb = ttk.Scrollbar(tab_rec, command=self.txt.yview)
-        self.txt.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        self.txt.pack(side="left", fill="both", expand=True)
-        for t, c in (("warn", C("warn")), ("ok", C("ok"))):
-            self.txt.tag_configure(t, foreground=c)
+        self.txt = ctk.CTkTextbox(tab_rec, corner_radius=10, wrap="none",
+                                  font=(MONO, 12), fg_color=C("log_bg"),
+                                  text_color=C("log_fg"), border_width=0)
+        self.txt.pack(fill="both", expand=True, padx=2, pady=4)
+        self.txt.configure(state="disabled")
+        for t, k in (("warn", "warn"), ("ok", "ok"), ("muted", "muted")):
+            self.txt.tag_config(t, foreground=C1(k))
+        self.txt._textbox.configure(insertbackground=C1("log_fg"))
 
-        # 分页 2：上传（每段一张进度表 + 上传专属日志）
-        tab_up = ttk.Frame(nb)
-        nb.add(tab_up, text=" 上传 ")
-        top = ttk.Frame(tab_up)
-        top.pack(fill="x", padx=4, pady=(4, 2))
-        cols = ("seg", "anchor", "state", "pct")
-        self.up_tree = ttk.Treeview(top, columns=cols, show="headings", height=6)
-        for c, w, t in (("seg", 90, "段 / 分P"), ("anchor", 180, "主播"),
-                        ("state", 190, "状态"), ("pct", 150, "进度")):
-            self.up_tree.heading(c, text=t)
-            self.up_tree.column(c, width=w, anchor="center")
-        sb2 = ttk.Scrollbar(top, command=self.up_tree.yview)
-        self.up_tree.configure(yscrollcommand=sb2.set)
-        sb2.pack(side="right", fill="y")
-        self.up_tree.pack(side="left", fill="both", expand=True)
-
-        bottom = ttk.Frame(tab_up)
-        bottom.pack(fill="both", expand=True, padx=4, pady=(2, 4))
-        self.up_txt = tk.Text(bottom, height=8, wrap="none", state="disabled",
-                              background=C("log_bg"), relief="flat")
-        sb3 = ttk.Scrollbar(bottom, command=self.up_txt.yview)
-        self.up_txt.configure(yscrollcommand=sb3.set)
-        sb3.pack(side="right", fill="y")
-        self.up_txt.pack(side="left", fill="both", expand=True)
-        for t, c in (("warn", C("warn")), ("ok", C("ok"))):
-            self.up_txt.tag_configure(t, foreground=c)
+        # 分页 2：上传（每段一张卡片 + 上传专属日志）
+        bar_up = ctk.CTkFrame(tab_up, fg_color="transparent")
+        bar_up.pack(fill="x", padx=4, pady=(2, 0))
+        self.var_uplog = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(bar_up, text="显示上传日志", variable=self.var_uplog,
+                        command=self._toggle_uplog, font=(FONT, 11),
+                        checkbox_width=16, checkbox_height=16,
+                        corner_radius=4).pack(side="right")
+        self.up_txt = ctk.CTkTextbox(tab_up, corner_radius=10, wrap="none",
+                                     font=(MONO, 11), fg_color=C("log_bg"),
+                                     text_color=C("log_fg"), border_width=0, height=90)
+        self.up_list = ctk.CTkScrollableFrame(tab_up, corner_radius=10,
+                                              fg_color=C("card2"))
+        self.up_list.pack(fill="both", expand=True, padx=2, pady=(2, 6))
+        self.up_txt.configure(state="disabled")
+        for t, k in (("warn", "warn"), ("ok", "ok")):
+            self.up_txt.tag_config(t, foreground=C1(k))
 
         self._load_failed_rows()
         self._load_delete_setting()
@@ -337,42 +386,28 @@ class RecorderApp:
         self._apply_theme(not self.dark, save=True)
 
     def _apply_theme(self, dark: bool, save: bool = False) -> None:
-        """切换深/浅色：ttk 交给 sv-ttk，自定义颜色（日志底色、状态字）自己刷一遍。"""
+        """切深浅色。CTk 控件用的是 (浅,深) 色对，切完自己会重画；
+        需要手动处理的是 Text 的 tag 颜色（它只认具体色值）。"""
         global DARK
         DARK = bool(dark)
         self.dark = DARK
-        if HAS_THEME:
-            try:
-                sv_ttk.set_theme("dark" if DARK else "light")
-            except Exception:
-                pass
-        # 字号统一一点，中文用雅黑（sv-ttk 默认的 Segoe UI 没有中文字形）
-        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont",
-                     "TkHeadingFont", "TkTooltipFont"):
-            try:
-                tkfont.nametofont(name).configure(family="Microsoft YaHei UI", size=10)
-            except Exception:
-                pass
-
-        for w, kind in self._themed:
-            try:
-                w.configure(foreground=C(kind))
-            except Exception:
-                pass
+        try:
+            ctk.set_appearance_mode("dark" if DARK else "light")
+        except Exception:
+            pass
         for txt in (getattr(self, "txt", None), getattr(self, "up_txt", None)):
             if txt is None:
                 continue
             try:
-                txt.configure(background=C("log_bg"), foreground=C("log_fg"),
-                              insertbackground=C("log_fg"),
-                              selectbackground=("#2f6f6a" if DARK else "#cfe8e6"))
+                txt.configure(fg_color=C("log_bg"), text_color=C("log_fg"))
+                txt._textbox.configure(insertbackground=C1("log_fg"))
                 for t, k in (("warn", "warn"), ("ok", "ok"), ("muted", "muted")):
-                    txt.tag_configure(t, foreground=C(k))
+                    txt.tag_config(t, foreground=C1(k))
             except Exception:
                 pass
         for r in getattr(self, "rows", []):
             try:
-                r["state"].configure(foreground=C(r.get("state_kind") or "muted"))
+                r["state"].configure(text_color=C(r.get("state_kind") or "muted"))
             except Exception:
                 pass
         if hasattr(self, "btn_theme"):
@@ -388,54 +423,70 @@ class RecorderApp:
     def add_row(self, room: str = "", quality: str = "", segment: str = "",
                 season=None) -> dict:
         idx = len(self.rows) + 1
-        f = ttk.Frame(self.rows_frame)
+        f = ctk.CTkFrame(self.rows_frame, fg_color="transparent")
         f.pack(fill="x", pady=2)
 
-        lbl_no = ttk.Label(f, text=f"#{idx}", width=4)
+        lbl_no = ctk.CTkLabel(f, text=f"#{idx}", width=26, font=(FONT, 12),
+                              text_color=C("muted"), anchor="w")
         lbl_no.pack(side="left")
         var_room = tk.StringVar(value=room)
-        e = ttk.Entry(f, textvariable=var_room, width=12)
-        e.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        e = ctk.CTkEntry(f, textvariable=var_room, height=32, corner_radius=8,
+                         font=(FONT, 12), placeholder_text="抖音号 / 房间号 / 直播间链接")
+        e.pack(side="left", fill="x", expand=True, padx=(2, 8))
 
         var_q = tk.StringVar(value=_quality_label(quality))
-        cb = ttk.Combobox(f, textvariable=var_q, state="readonly", width=17,
-                          values=[QUALITY_LABEL[q] for q in QUALITY_CHOICES])
+        cb = ctk.CTkOptionMenu(f, variable=var_q, width=150, height=32,
+                               corner_radius=8, font=(FONT, 11),
+                               values=[QUALITY_LABEL[q] for q in QUALITY_CHOICES],
+                               fg_color=C("sub"), button_color=C("sub_hover"),
+                               text_color=C("sub_text"))
         cb.pack(side="left", padx=(0, 6))
 
         # 每个主播自己的分段时间（主界面「公共设置」里那个只作为新行的默认值）
         var_s = tk.StringVar(value=_segment_label(segment) if segment
                              else self.var_segment.get())
-        scb = ttk.Combobox(f, textvariable=var_s, state="readonly", width=13,
-                           values=[s[0] for s in SEGMENT_CHOICES])
+        scb = ctk.CTkOptionMenu(f, variable=var_s, width=118, height=32,
+                                corner_radius=8, font=(FONT, 11),
+                                values=[s[0] for s in SEGMENT_CHOICES],
+                                fg_color=C("sub"), button_color=C("sub_hover"),
+                                text_color=C("sub_text"))
         scb.pack(side="left", padx=(0, 6))
 
         row = {"frame": f, "no": lbl_no, "room": var_room, "quality": var_q,
                "segment": var_s, "seg_combo": scb,
                "season": season if isinstance(season, dict) else None,
                "entry": e, "combo": cb, "thread": None, "stop": None,
-               "running": False, "rid": "", "_tag": ""}
+               "running": False, "rid": "", "_tag": "", "state_kind": "muted"}
 
         # 合集：点一下从账号里所有合集里挑一个，投稿成功后自动加进去
-        b_season = ttk.Button(f, text=self._season_text(row["season"]), width=9,
-                              command=lambda r=row: self.pick_season(r))
-        b_season.pack(side="left", padx=(0, 4))
+        b_season = self._sub_btn(f, self._season_text(row["season"]), width=84,
+                                 height=32)
+        b_season.configure(command=lambda r=row: self.pick_season(r),
+                           font=(FONT, 11))
+        b_season.pack(side="left", padx=(0, 6))
         row["btn_season"] = b_season
 
-        b_start = ttk.Button(f, text="开始", width=5,
-                             command=lambda r=row: self.start_row(r))
-        b_start.pack(side="left", padx=(0, 2))
-        b_stop = ttk.Button(f, text="停止", width=5,
-                            command=lambda r=row: self.stop_row(r))
-        b_stop.pack(side="left", padx=(0, 6))
+        b_start = ctk.CTkButton(f, text="开始", width=54, height=32, corner_radius=8,
+                                font=(FONT, 12),
+                                command=lambda r=row: self.start_row(r))
+        b_start.pack(side="left", padx=(0, 4))
+        b_stop = self._sub_btn(f, "停止", lambda r=row: self.stop_row(r),
+                               width=54, height=32)
+        b_stop.pack(side="left", padx=(0, 8))
         row["btn_start"], row["btn_stop"] = b_start, b_stop
 
-        lbl = ttk.Label(f, text="● 未启动", width=9, foreground=C("muted"))
-        lbl.pack(side="left", padx=(0, 6))
+        lbl = ctk.CTkLabel(f, text="● 未启动", width=84, font=(FONT, 11),
+                           text_color=C("muted"), anchor="w")
+        lbl.pack(side="left")
         row["state"] = lbl
-        row["state_kind"] = "muted"
 
-        ttk.Button(f, text="删", width=4,
-                   command=lambda r=row: self.del_row(r)).pack(side="left")
+        b_del = ctk.CTkButton(f, text="✕", width=30, height=32, corner_radius=8,
+                              font=(FONT, 13), fg_color="transparent",
+                              hover_color=("#fbe3e3", "#3a2222"),
+                              text_color=C("err"),
+                              command=lambda r=row: self.del_row(r))
+        b_del.pack(side="left")
+
         self.rows.append(row)
         self._sync_state()
         return row
@@ -444,7 +495,7 @@ class RecorderApp:
         """改这一行的状态字，同时记住颜色语义（切主题时要按它重刷）。"""
         row["state_kind"] = kind
         try:
-            row["state"].configure(text=text, foreground=C(kind))
+            row["state"].configure(text=text, text_color=C(kind))
         except Exception:
             pass
 
@@ -454,7 +505,7 @@ class RecorderApp:
         if not season:
             return "合集"
         t = str((season or {}).get("title") or "").strip()
-        return (t[:5] + "…") if len(t) > 5 else (t or "合集")
+        return (t[:4] + "…") if len(t) > 4 else (t or "合集")
 
     def pick_season(self, row: dict) -> None:
         """选这个主播要自动加入的合集：拉账号下所有合集，让用户挑一个。"""
@@ -465,67 +516,74 @@ class RecorderApp:
                                    "先点「B 站扫码登录」，才能读到你的合集列表")
             return
 
-        win = tk.Toplevel(self.root)
+        win = ctk.CTkToplevel(self.root)
         win.title("选择合集")
-        win.geometry("520x460")
+        win.geometry("560x560")
         win.transient(self.root)
         win.grab_set()
 
-        ttk.Label(win, text="这个主播投稿成功后，新视频自动加进所选合集。",
-                  foreground=C("muted")).pack(anchor="w", padx=12, pady=(10, 2))
+        ctk.CTkLabel(win, text="这个主播投稿成功后，新视频自动加进所选合集。",
+                     font=(FONT, 11), text_color=C("muted")).pack(
+            anchor="w", padx=16, pady=(14, 2))
         cur = row.get("season") or {}
-        lbl_cur = ttk.Label(win, text=("当前：" + (cur.get("title") or "未选择")),
-                            font=("Microsoft YaHei UI", 9, "bold"))
-        lbl_cur.pack(anchor="w", padx=12)
+        lbl_cur = ctk.CTkLabel(win, text="当前：" + (cur.get("title") or "未选择"),
+                               font=(FONT, 13, "bold"), anchor="w")
+        lbl_cur.pack(anchor="w", padx=16)
 
         search = tk.StringVar()
-        ent = ttk.Entry(win, textvariable=search)
-        ent.pack(fill="x", padx=12, pady=(8, 4))
+        ctk.CTkEntry(win, textvariable=search, height=32, corner_radius=8,
+                     font=(FONT, 12), placeholder_text="输入关键词筛选…").pack(
+            fill="x", padx=16, pady=(10, 8))
 
-        box = ttk.Frame(win)
-        box.pack(fill="both", expand=True, padx=12)
-        tv = ttk.Treeview(box, columns=("title", "count"), show="headings",
-                          height=12, selectmode="browse")
-        for c, w, t in (("title", 330, "合集"), ("count", 90, "视频数")):
-            tv.heading(c, text=t)
-            tv.column(c, width=w, anchor="w" if c == "title" else "center")
-        sb = ttk.Scrollbar(box, command=tv.yview)
-        tv.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        tv.pack(side="left", fill="both", expand=True)
+        listbox = ctk.CTkScrollableFrame(win, corner_radius=10, fg_color=C("card2"))
+        listbox.pack(fill="both", expand=True, padx=16)
 
-        status = ttk.Label(win, text="正在读取合集列表…", foreground=C("muted"))
-        status.pack(anchor="w", padx=12, pady=(4, 0))
+        status = ctk.CTkLabel(win, text="正在读取合集列表…", font=(FONT, 11),
+                              text_color=C("muted"), anchor="w")
+        status.pack(fill="x", padx=16, pady=(6, 0))
 
-        state = {"items": []}
+        state = {"items": [], "picked": None}
 
         def fill(*_):
+            for w in listbox.winfo_children():
+                w.destroy()
             kw = search.get().strip()
-            tv.delete(*tv.get_children())
             for it in state["items"]:
                 if kw and kw not in it["title"]:
                     continue
-                tv.insert("", "end", iid=str(it["id"]),
-                          values=(it["title"] or f"（无标题 {it['id']}）", it["count"]))
+                picked = state["picked"] == it["id"]
+                b = ctk.CTkButton(
+                    listbox, text=f"{it['title'] or ('（无标题 %s）' % it['id'])}"
+                                  f"   ·   {it['count']} 个视频",
+                    anchor="w", height=34, corner_radius=8, font=(FONT, 12),
+                    fg_color=("#2563eb" if picked else "transparent"),
+                    hover_color=C("sub_hover"),
+                    text_color=("#ffffff" if picked else C("sub_text")),
+                    command=lambda i=it: choose(i))
+                b.pack(fill="x", pady=2)
+
+        def choose(it):
+            state["picked"] = it["id"]
+            lbl_cur.configure(text="当前：" + (it["title"] or "未选择"))
+            fill()
 
         def reload_seasons():
-            status.configure(text="正在读取合集列表…", foreground=C("muted"))
+            status.configure(text="正在读取合集列表…", text_color=C("muted"))
             win.update_idletasks()
             try:
                 state["items"] = bu.list_seasons(cred)
             except Exception as e:
-                status.configure(text=f"读取失败：{e}", foreground=C("warn"))
+                status.configure(text=f"读取失败：{e}", text_color=C1("warn"))
                 return
             fill()
             status.configure(text=f"共 {len(state['items'])} 个合集（输入可筛选）",
-                             foreground=C("muted"))
+                             text_color=C("muted"))
 
         def apply_choice():
-            sel = tv.selection()
-            if not sel:
+            sid = state["picked"]
+            if not sid:
                 messagebox.showinfo("还没选", "先在上面的列表里点一个合集", parent=win)
                 return
-            sid = int(sel[0])
             item = next((i for i in state["items"] if i["id"] == sid), None)
             if not item:
                 return
@@ -543,16 +601,16 @@ class RecorderApp:
             self._save_settings()
             win.destroy()
 
-        btns = ttk.Frame(win)
-        btns.pack(fill="x", padx=12, pady=10)
-        ttk.Button(btns, text="加入这个合集", command=apply_choice,
-                   style=("Accent.TButton" if HAS_THEME else None)).pack(side="left")
-        ttk.Button(btns, text="清空（不加合集）", command=clear_choice).pack(side="left", padx=8)
-        ttk.Button(btns, text="刷新", command=reload_seasons).pack(side="left")
-        ttk.Button(btns, text="取消", command=win.destroy).pack(side="right")
+        btns = ctk.CTkFrame(win, fg_color="transparent")
+        btns.pack(fill="x", padx=16, pady=12)
+        ctk.CTkButton(btns, text="加入这个合集", command=apply_choice, width=112,
+                      height=34, corner_radius=9, font=(FONT, 12)).pack(side="left")
+        self._sub_btn(btns, "清空（不加合集）", clear_choice, width=124, height=34).pack(
+            side="left", padx=8)
+        self._sub_btn(btns, "刷新", reload_seasons, width=64, height=34).pack(side="left")
+        self._sub_btn(btns, "取消", win.destroy, width=64, height=34).pack(side="right")
 
         search.trace_add("write", fill)
-        tv.bind("<Double-1>", lambda e: apply_choice())
         reload_seasons()
 
     def del_row(self, row: dict) -> None:
@@ -580,7 +638,7 @@ class RecorderApp:
         except Exception:
             d = {}
         rooms = d.get("rooms") or []
-        if not rooms and d.get("room"):                 # 兼容只有单个房间的旧设置
+        if not rooms and d.get("room"):
             rooms = [{"room": d.get("room", ""), "quality": d.get("quality", "")}]
         self.dark = (d.get("theme") or "light") == "dark"
         # 先恢复「默认分段时间」：add_row 建行时拿它当兜底
@@ -591,9 +649,11 @@ class RecorderApp:
         if not self.rows:
             self.add_row()
         self.var_duration.set(d.get("duration", DURATION_CHOICES[0][0]))
-        self.var_dir.set(d.get("out_dir", str(rec.DEFAULT_DIR)))
+        if self.var_duration.get() not in [x[0] for x in DURATION_CHOICES]:
+            self.var_duration.set(DURATION_CHOICES[0][0])
+        self.var_dir.set(d.get("out_dir") or str(rec.DEFAULT_DIR))
         self.var_wait_mode.set(d.get("wait_mode", "forever"))
-        self.var_wait_min.set(str(d.get("wait_min", 30)))
+        self.var_wait_min.set(str(d.get("wait_min", "30")))
         self.var_upload.set(bool(d.get("upload", True)))
         self.var_monitor.set(bool(d.get("monitor", True)))
 
@@ -648,10 +708,10 @@ class RecorderApp:
             return -1
         if mode == "limit":
             try:
-                return max(30, int(float(self.var_wait_min.get()) * 60))
+                return max(0, int(float(self.var_wait_min.get()) * 60))
             except Exception:
                 return 1800
-        return 0                       # 一直等
+        return 0
 
     # ─────────────────── 日志 / 状态 ───────────────────
     def _log_from_thread(self, *a, live: str = "") -> None:
@@ -666,9 +726,8 @@ class RecorderApp:
         """写一行到「录制日志」。
 
         live 非空 = 这是**进度型**日志（「已写 3.20 GB，已录 01:23:45」这类）：
-        同一个 key 在控制台只留最新一条 —— 先删掉旧的那行，再把新的接在末尾，
-        免得一个直播间每 15 秒堆一行把日志刷没。
-        文件日志（logs/gui.log）照旧全部追加，事后能查完整轨迹（含等待开播的日志）。
+        同一个 key 在控制台只留最新一条 —— 先删掉旧的那行，再把新的接在末尾。
+        文件日志（logs/gui.log）照旧全部追加，事后能查完整轨迹。
         """
         tag = ""
         if text.startswith("[!]") or "[x]" in text or "失败" in text:
@@ -685,7 +744,10 @@ class RecorderApp:
                 pass
         start = self.txt.index("end-1c")
         line = f"[{time.strftime('%H:%M:%S')}] {text}\n"
-        self.txt.insert("end", line, tag)
+        if tag:
+            self.txt.insert("end", line, tag)
+        else:
+            self.txt.insert("end", line)
         if live:
             try:                                        # 给新的一行打上同一个 key
                 self.txt.tag_add(f"live:{live}", start, f"{start}+{len(line)}c")
@@ -704,7 +766,10 @@ class RecorderApp:
             tag = "ok"
         try:
             self.up_txt.configure(state="normal")
-            self.up_txt.insert("end", f"[{time.strftime('%H:%M:%S')}] {text}\n", tag)
+            if tag:
+                self.up_txt.insert("end", f"[{time.strftime('%H:%M:%S')}] {text}\n", tag)
+            else:
+                self.up_txt.insert("end", f"[{time.strftime('%H:%M:%S')}] {text}\n")
             self.up_txt.see("end")
             self.up_txt.configure(state="disabled")
         except Exception:
@@ -712,19 +777,56 @@ class RecorderApp:
         file_log(text)
 
     def _up_row(self, iid, seq, anchor, state, pct) -> None:
-        """上传分页的表格行：存在就更新，不存在就插入。"""
+        """上传分页的一行：不存在就建一张卡片，存在就原地更新。"""
+        w = self.up_rows.get(iid)
+        if w is None:
+            card = ctk.CTkFrame(self.up_list, corner_radius=9, fg_color=C("card"),
+                                height=42, border_width=1, border_color=C("border"))
+            card.pack(fill="x", pady=3, padx=2)
+            card.pack_propagate(False)
+            lbl_seg = ctk.CTkLabel(card, text=seq, width=86, font=(FONT, 11, "bold"),
+                                   anchor="w")
+            lbl_seg.pack(side="left", padx=(10, 4))
+            lbl_anchor = ctk.CTkLabel(card, text=anchor, width=150, font=(FONT, 11),
+                                      text_color=C("muted"), anchor="w")
+            lbl_anchor.pack(side="left", padx=(0, 4))
+            lbl_state = ctk.CTkLabel(card, text=state, width=150, font=(FONT, 11),
+                                     anchor="w")
+            lbl_state.pack(side="left", padx=(0, 8))
+            bar = ctk.CTkProgressBar(card, height=6, corner_radius=3, width=120)
+            bar.set(0)
+            bar.pack(side="left", fill="x", expand=True, padx=(0, 8))
+            lbl_pct = ctk.CTkLabel(card, text=str(pct), width=140, font=(FONT, 10),
+                                   text_color=C("muted"), anchor="w")
+            lbl_pct.pack(side="left", padx=(0, 8))
+            w = {"card": card, "seg": lbl_seg, "anchor": lbl_anchor, "state": lbl_state,
+                 "bar": bar, "pct": lbl_pct}
+            self.up_rows[iid] = w
         try:
-            if self.up_tree.exists(iid):
-                if anchor:
-                    self.up_tree.item(iid, values=(seq, anchor, state, pct))
-                else:                  # 只更新进度/状态，保留已有的主播名
-                    vals = self.up_tree.item(iid, "values")
-                    self.up_tree.item(iid, values=(vals[0], vals[1], state, pct))
+            if seq:
+                w["seg"].configure(text=seq)
+            if anchor:
+                w["anchor"].configure(text=anchor)
+            w["state"].configure(text=state)
+            w["pct"].configure(text=str(pct))
+            digits = "".join(ch for ch in str(pct).split("%")[0] if ch.isdigit())
+            pv = int(digits) / 100 if digits else 0
+            w["bar"].set(min(1.0, max(0.0, pv)))
+            if "已投稿" in state:
+                w["state"].configure(text_color=C("ok"))
+            elif "失败" in state or "待补传" in state:
+                w["state"].configure(text_color=C("warn"))
             else:
-                self.up_tree.insert("", "end", iid=iid,
-                                    values=(seq, anchor, state, pct))
+                w["state"].configure(text_color=C("sub_text"))
         except Exception:
             pass
+
+    def _toggle_uplog(self) -> None:
+        """上传日志默认收起来，把整个分页让给进度列表；调试时再勾出来。"""
+        if self.var_uplog.get():
+            self.up_txt.pack(side="bottom", fill="x", padx=2, pady=(0, 4))
+        else:
+            self.up_txt.pack_forget()
 
     def _load_failed_rows(self) -> None:
         """把以前投稿失败的段先填进「上传」页 —— 点「补传」就会重投它们。"""
@@ -744,13 +846,11 @@ class RecorderApp:
 
     def _on_upload_event(self, seq, phase, pct, anchor, done=0, total=0,
                          label="") -> None:
-        """上传事件 → 表格行。
+        """上传事件 → 那一行卡片。
 
         ⚠️ 只显示百分比是不够的：B 站固定 10MB 一块，2GB 的文件有 205 块，
         每块才 0.49% —— 前几十兆算出来一直是 0%，看着像卡住。
         所以连着块数一起显示（「0%（2/205 块）」），从第一块就看得出在动。
-
-        label 是「段 / 分P」那一列的文字：`#3 P2` = 第 3 段、这场直播的第 2 个分P。
         """
         iid = f"seq{seq}"
         seg = label or f"#{seq}"
@@ -780,13 +880,13 @@ class RecorderApp:
         try:
             from PIL import ImageTk
             self._qr_img = ImageTk.PhotoImage(pil)
-            self._qr_lbl.configure(image=self._qr_img)
+            self._qr_lbl.configure(image=self._qr_img, text="")
             if self._qr_hint is not None:
-                self._qr_hint.configure(text="等待扫码…", foreground=C("muted"))
+                self._qr_hint.configure(text="等待扫码…", text_color=C("muted"))
         except Exception as e:
             try:
                 self._qr_hint.configure(text=f"二维码显示失败，请用命令行登录：{e}",
-                                        foreground=C("warn"))
+                                        text_color=C("warn"))
             except Exception:
                 pass
 
@@ -813,37 +913,35 @@ class RecorderApp:
                     self.up_log(payload)
                 elif kind == "login":
                     text, color = payload
-                    self.lbl_login.configure(text=text, foreground=C(color))
+                    self.lbl_login.configure(text=text, text_color=C(color))
                 elif kind == "qr":
                     self._show_qr(payload)
                 elif kind == "qhint":
                     text, color = payload
                     if self._qr_hint is not None:
                         try:
-                            self._qr_hint.configure(text=text, foreground=C(color))
+                            self._qr_hint.configure(text=text, text_color=C(color))
                         except Exception:
                             pass                # 弹窗已被关掉
                 elif kind == "qdone":
                     who = payload
                     if self._qr_hint is not None:
                         try:
-                            self._qr_hint.configure(text=f"登录成功：{who}",
-                                                    foreground=C("ok"))
+                            self._qr_hint.configure(
+                                text=f"登录成功：{who}", text_color=C("ok"))
                         except Exception:
                             pass
+                    self.lbl_login.configure(text=f"登录状态：正常 · {who}",
+                                             text_color=C("ok"))
                     self.append_log(f"[√] B 站登录成功：{who}")
-                    self._check_login()
-                    self.root.after(1500, self._close_login_win)
+                    self.root.after(1200, self._close_login_win)
                 elif kind == "progress":
                     self._on_upload_event(*payload)
-                elif kind == "status":
-                    self.set_status(payload)
-                elif kind == "rowstate":
-                    row, txt = payload
+                elif kind == "rowdone":
+                    row, txt, kind2 = payload
                     try:
                         if row in self.rows:
-                            row["state"].configure(text="● " + txt)
-                            self._sync_state()
+                            self._set_row_state(row, txt, kind2)
                     except Exception:
                         pass                 # 行已经被删掉了
                 elif kind == "nrun":
@@ -851,7 +949,11 @@ class RecorderApp:
                     self._refresh_status()
         except queue.Empty:
             pass
-        self.root.after(150, self._drain_queue)
+        try:
+            if self.root.winfo_exists():          # 窗口已经关了就别再排下一轮
+                self.root.after(150, self._drain_queue)
+        except Exception:
+            pass
 
     def _refresh_status(self) -> None:
         """状态栏：几路在录 / 后台上传到百分之多少 / 还剩几段没传"""
@@ -864,9 +966,7 @@ class RecorderApp:
         if n:
             self.set_status(f"录制中：{n} 路" + (f"（后台上传 {up}）" if self._up_chunks else ""))
         elif pend:
-            self.set_status(f"录制结束，等后台上传：{up}（还剩 {pend} 段）")
-        elif done:
-            self.set_status(f"就绪（本次投稿 {done} 段）")
+            self.set_status(f"后台上传 {up} · 待传 {pend} 段（已传 {done}）")
         else:
             self.set_status("就绪")
 
@@ -897,8 +997,8 @@ class RecorderApp:
         for r in self.rows:
             run = bool(r.get("running"))
             r["entry"].configure(state="disabled" if run else "normal")
-            r["combo"].configure(state="disabled" if run else "readonly")
-            r["seg_combo"].configure(state="disabled" if run else "readonly")
+            r["combo"].configure(state="disabled" if run else "normal")
+            r["seg_combo"].configure(state="disabled" if run else "normal")
             r["btn_start"].configure(state="disabled" if run else "normal")
             r["btn_stop"].configure(state="normal" if run else "disabled")
 
@@ -987,46 +1087,47 @@ class RecorderApp:
             if r.get("running"):
                 self.stop_row(r)
                 n += 1
-        self.set_status(f"正在停止 {n} 路…" if n else "没有在录的")
+        if not n:
+            self.set_status("当前没有在录的")
 
+    # ─────────────────── 录制线程状态回传 ───────────────────
     def _start_monitor(self) -> None:
-        if self._mon is not None and self._mon.is_alive():
-            return
-        self._mon = threading.Thread(target=self._monitor, name="monitor",
-                                     daemon=True)
-        self._mon.start()
+        if self._mon is None or not self._mon.is_alive():
+            self._mon = threading.Thread(target=self._monitor, name="monitor",
+                                         daemon=True)
+            self._mon.start()
 
     def _monitor(self) -> None:
-        """盯着每行的录制线程，结束了就更新那一行（后台线程，只往队列扔）。"""
+        """盯着线程有没有结束：结束了把行状态改回「已停止」，并刷新计数。"""
         while True:
+            time.sleep(0.5)
+            alive = 0
             for r in list(self.rows):
-                if r.get("running") and r["thread"] is not None \
-                        and not r["thread"].is_alive():
+                if not r.get("running"):
+                    continue
+                t = r.get("thread")
+                if t is not None and not t.is_alive():
                     r["running"] = False
-                    self.q.put(("rowstate", (r, "已结束")))
-            self.q.put(("nrun", sum(1 for r in self.rows if r.get("running"))))
-            time.sleep(1)
+                    self.q.put(("rowdone", (r, "● 已停止", "muted")))
+                else:
+                    alive += 1
+            self.q.put(("nrun", alive))
+            if alive == 0 and not self.threads:
+                return
 
-    # ─────────────────── B 站 ───────────────────
+    # ─────────────────── 登录 / 配置 ───────────────────
     def _check_login(self) -> None:
-        """登录状态：先看字段在不在，再**后台实测**一次 cookie 是否还有效。
-
-        只显示「已登录」是不够的 —— cookie 过期时字段齐全、界面看着正常，
-        真上传才会在最后一步炸。这里用 nav 接口实测，失效就显眼地提示重登。
-        """
-        try:
-            cfg, _ = bu.load_config()
-        except bu.BiliError as e:
-            self.lbl_login.configure(text=f"配置有问题：{e}", foreground=C("warn"))
-            return
-        d = bu.read_credential(cfg.cred_file)
-        if not d:
-            self.lbl_login.configure(text="登录状态：未登录（不会投稿）",
-                                     foreground=C("warn"))
-            return
-        self.lbl_login.configure(text="登录状态：检查中…", foreground=C("muted"))
-
         def work():
+            try:
+                cfg, _ = bu.load_config()
+            except Exception as e:
+                self.q.put(("login", (f"配置有问题：{e}", "warn")))
+                return
+            d = bu.read_credential(cfg.cred_file)
+            if not d:
+                self.q.put(("login", ("登录状态：未登录（不会投稿）", "warn")))
+                return
+            self.q.put(("login", ("登录状态：检查中…", "muted")))
             try:
                 status, detail = bu.check_cookie_status(d)
             except Exception as e:
@@ -1056,47 +1157,47 @@ class RecorderApp:
         """勾选框跟着 bili.toml 走（GUI 和命令行共用同一份配置）。"""
         try:
             cfg, _ = bu.load_config()
-            self.var_delete.set(bool(getattr(cfg, "delete_after_upload", False)))
+            self.var_delete.set(bool(cfg.delete_after_upload))
         except Exception:
             self.var_delete.set(False)
 
     def on_toggle_delete(self) -> None:
-        """勾/取消勾 → 立刻写回 bili.toml，并让后台上传队列下次重新读配置。"""
         want = bool(self.var_delete.get())
         try:
-            path = bu.set_config_value("delete_after_upload",
-                                       "true" if want else "false")
+            bu.set_config_value("delete_after_upload", "true" if want else "false")
         except Exception as e:
-            self.var_delete.set(not want)          # 写不进去就把勾选框退回去
-            messagebox.showerror("改不了配置", f"写 {bu.DEFAULT_CONFIG.name} 失败：{e}")
+            messagebox.showerror("写配置失败", f"bili.toml 没写进去：{e}")
+            self.var_delete.set(not want)
             return
         if self.uploader is not None:
-            self.uploader.reload_cfg()             # 正在跑的队列也换成新值
-        if want:
-            self.append_log("[i] 已开启「上传成功后删除本地视频」"
-                            f"（{Path(path).name} 里 delete_after_upload = true）")
-            self.append_log("    ⚠️ 只删确认投稿成功的那几个文件，删了找不回来；"
-                            "要留本地档就别开")
-        else:
-            self.append_log("[i] 已关闭「上传成功后删除本地视频」，录好的文件都会留着")
+            self.uploader.reload_cfg()
+        self.append_log("[i] 上传成功后删除本地视频：" + ("开" if want else "关"))
 
     def fix_uploads(self) -> None:
-        """补传：把投稿失败的稿件重新投一遍（跨重启也在，406 风控解除后用它）。
+        """把以前投稿失败的段重新排队（串行重投，进度看「上传」页）。"""
+        def put(t):
+            self.q.put(("uplog", t))
 
-        失败记录在 exe 同目录的 bili_failed_uploads.json；重新排队走同一条
-        串行上传队列，节流（防 406）和进度显示照常生效。
-        """
         def work():
-            def put(*a):
-                self.q.put(("log", " ".join(map(str, a))))
             try:
-                w = self.uploader or self._ensure_uploader()
-                n_failed = len(w.failed) + len(bu.load_failed())
-                if not n_failed:
-                    put("[i] 没有投稿失败的稿件，不用补传。")
+                items = bu.load_failed()
+                if not items:
+                    put("[i] 没有待补传的段")
                     return
-                put(f"[i] 有 {n_failed} 段投稿失败，开始补传…")
-                n = w.retry_failed(log=put)
+                w = self._ensure_uploader()
+                n = 0
+                for it in items:
+                    try:
+                        w.submit({"start": it.get("start"), "files": it.get("files") or []},
+                                 rid=it.get("rid") or "", anchor=it.get("anchor") or "",
+                                 live_title=it.get("live_title") or "",
+                                 quality=it.get("quality") or "",
+                                 ffmpeg=it.get("ffmpeg") or "",
+                                 session=it.get("session"), part=it.get("part") or 0,
+                                 season=it.get("season"))
+                        n += 1
+                    except Exception as e:
+                        put(f"[!] 这一段排不进去：{e}")
                 if n:
                     put(f"[i] 补传已排队 {n} 段，串行上传中（进度看状态栏）")
                 else:
@@ -1115,17 +1216,18 @@ class RecorderApp:
         所以后台线程只干「拉二维码 / 轮询」这些纯网络的事，
         所有界面更新一律通过 self.q 交给主线程的 _drain_queue 落地。
         """
-        win = tk.Toplevel(self.root)
+        win = ctk.CTkToplevel(self.root)
         win.title("B 站扫码登录")
-        win.geometry("360x420")
+        win.geometry("380x440")
         win.transient(self.root)
         win.resizable(False, False)
 
-        ttk.Label(win, text="用 B 站 App 扫码，并在手机上确认",
-                  font=("Microsoft YaHei UI", 10)).pack(pady=(12, 6))
-        img_lbl = ttk.Label(win)
+        ctk.CTkLabel(win, text="用 B 站 App 扫码，并在手机上确认",
+                     font=(FONT, 13)).pack(pady=(16, 8))
+        img_lbl = ctk.CTkLabel(win, text="")
         img_lbl.pack(pady=6)
-        hint = ttk.Label(win, text="正在获取二维码…", foreground=C("muted"), wraplength=320)
+        hint = ctk.CTkLabel(win, text="正在获取二维码…", font=(FONT, 11),
+                            text_color=C("muted"), wraplength=320)
         hint.pack(pady=6)
         self._login_win, self._qr_lbl, self._qr_hint = win, img_lbl, hint
 
@@ -1136,7 +1238,7 @@ class RecorderApp:
             except Exception:
                 pass
         win.protocol("WM_DELETE_WINDOW", close_win)
-        ttk.Button(win, text="关闭", command=close_win).pack(pady=(4, 10))
+        self._sub_btn(win, "关闭", close_win, width=80, height=32).pack(pady=(6, 12))
 
         def work():
             def hint_msg(t, color="muted"):
@@ -1195,8 +1297,6 @@ class RecorderApp:
 
         threading.Thread(target=work, name="qrlogin", daemon=True).start()
 
-        threading.Thread(target=work, name="qrlogin", daemon=True).start()
-
     # ─────────────────── 其它 ───────────────────
     def pick_dir(self) -> None:
         d = filedialog.askdirectory(title="选择录制输出目录",
@@ -1227,59 +1327,45 @@ def selftest() -> int:
     因为 bilibili_api 的接口配置是 data/api/*.json，打包时最容易漏。
     """
     ok = True
-    print(f"APP_DIR  = {APP_DIR}")
-    print(f"frozen   = {getattr(sys, 'frozen', False)}")
-    print(f"python   = {sys.version.split()[0]}")
+    print(f"Python {sys.version.split()[0]}  frozen={getattr(sys, 'frozen', False)}")
+    print(f"目录 {APP_DIR}")
 
     def check(label, fn):
         nonlocal ok
         try:
-            detail = fn()
-            print(f"  [OK]   {label}" + (f"  {detail}" if detail else ""))
+            info = fn()
+            print(f"  [OK]   {label}" + (f"  {info}" if info else ""))
         except Exception as e:
             ok = False
-            print(f"  [FAIL] {label}  {type(e).__name__}: {e}")
+            print(f"  [FAIL] {label}: {type(e).__name__}: {e}")
 
-    print("依赖：")
-    import tkinter  # noqa: F401
+    print("第三方库：")
 
     def ver(name):
-        """打包后不一定带 .dist-info 元数据，拿不到版本不算失败"""
-        try:
-            from importlib.metadata import version
-            return version(name)
-        except Exception:
-            return "版本未知（打包后没带元数据，不影响运行）"
+        m = __import__(name)
+        return getattr(m, "__version__", "")
 
     def check_import(label, mod, extra=""):
-        def fn():
-            __import__(mod, fromlist=["x"])
-            return f"{label} {ver(extra or mod)}"
-        check(label, fn)
-
-    check("tkinter", lambda: f"TkVersion={tkinter.TkVersion}")
-    check_import("PIL.ImageTk", "PIL.ImageTk", "pillow")
+        def _do():
+            __import__(mod)
+            return extra
+        check(label, _do)
+    check("customtkinter", lambda: ver("customtkinter"))
+    check_import("PIL", "PIL")
     check_import("qrcode", "qrcode")
     check_import("requests", "requests")
-    check_import("bilibili_api", "bilibili_api", "bilibili-api-python")
+
+    print("bilibili_api：")
 
     def check_video_uploader():
-        from bilibili_api import video_uploader
-        n = len(video_uploader._API)
-        if n == 0:
-            raise RuntimeError("接口配置是空的（data/api/*.json 没打进去？）")
-        return f"{n} 个接口配置"
-    check("bilibili_api 接口配置(data/api)", check_video_uploader)
+        from bilibili_api import video_uploader  # noqa: F401
+        return "投稿模块可用"
+    check("video_uploader", check_video_uploader)
 
     def check_http_client():
-        """bilibili_api 自己不带 HTTP 客户端，必须有 curl_cffi / httpx / aiohttp 之一。
-        缺了的话界面能开、录制也行，但一投稿就报「尚未安装第三方请求库」。"""
         import asyncio
-
-        async def pick():
-            from bilibili_api.utils.network import get_client
-            return type(get_client()).__name__
-        return asyncio.run(pick())
+        from bilibili_api.utils.network import get_client
+        return type(get_client()).__name__
     check("bilibili_api 请求客户端", check_http_client)
 
     print("项目模块：")
@@ -1363,16 +1449,12 @@ def selftest() -> int:
 def main() -> None:
     if "--selftest" in sys.argv:
         sys.exit(selftest())
-    root = tk.Tk()
     try:                                  # 高 DPI 屏上别糊
         from ctypes import windll
         windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         pass
-    try:
-        ttk.Style().theme_use("vista")
-    except Exception:
-        pass
+    root = ctk.CTk()
     RecorderApp(root)
     root.mainloop()
 

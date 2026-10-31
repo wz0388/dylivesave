@@ -9,5 +9,5 @@ qrcode-terminal>=0.8
 # 装 httpx 或 aiohttp 也可以。
 curl_cffi>=0.7.0
 
-# 界面主题（Windows 11 风格）。没装也能跑，只是回到 ttk 默认那套灰扑扑的外观。
-sv-ttk>=2.6
+# 界面（圆角卡片 / 扁平按钮 / 深浅色）。这个是硬依赖：界面整个是它画的。
+customtkinter>=6.0

@@ -17,14 +17,14 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
 
-import tkinter as tk     # noqa: E402
+import customtkinter as ctk   # noqa: E402
 
 import record_gui as g   # noqa: E402
 
 
 def _new_app(settings: Path):
     g.SETTINGS = settings
-    root = tk.Tk()
+    root = ctk.CTk()
     root.withdraw()
     return g.RecorderApp(root), root
 

@@ -46,12 +46,12 @@ def test_emit_log() -> None:
 
 def test_console_single_line() -> None:
     import queue
-    import tkinter as tk
+    import customtkinter as ctk
 
     g.file_log = lambda text: FILE_LINES.append(text)   # 别往仓库里写 logs/gui.log
-    root = tk.Tk()
+    root = ctk.CTk()
     root.withdraw()
-    txt = tk.Text(root)
+    txt = ctk.CTkTextbox(root)
 
     class Fake:
         pass
