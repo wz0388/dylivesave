@@ -223,6 +223,64 @@ def human(size):
     return f"{mb:.1f} MB" if mb < 1024 else f"{mb / 1024:.2f} GB"
 
 
+#: ffmpeg 报的 `Error number -N` 里 N 的含义（mingw 版的 errno 编号，
+#: 不是 Windows 的 WSA 错误码 —— 想查 WSA 10060 会查不到）
+NET_ERRNO_HINTS = {
+    138: "连接超时（ETIMEDOUT：TCP 都没连上，不是 403/签名问题）",
+    140: "连接超时（ETIMEDOUT）",
+    110: "连接超时（ETIMEDOUT）",
+    107: "连接被拒绝（ECONNREFUSED）",
+    113: "主机不可达（EHOSTUNREACH）",
+    118: "网络不可达（ENETUNREACH）",
+    104: "连接被重置（ECONNRESET）",
+}
+
+
+def explain_net_error(err_tail) -> str:
+    """从 ffmpeg 的报错尾巴里认出「连不上」，翻译成一句人话（认不出就返回空）。"""
+    for line in err_tail:
+        m = re.search(r"Error number -(\d+)", line)
+        if m:
+            code = int(m.group(1))
+            return NET_ERRNO_HINTS.get(code, f"系统错误码 {code}")
+    return ""
+
+
+def check_stream_host(url: str, timeout: float = 4.0, tries: int = 2) -> tuple[bool, str]:
+    """开录前试连一下拉流服务器，返回 (连得上吗, 说明)。
+
+    「本机能录、云服务器不能录」基本都是这一步失败：抖音的拉流 CDN 只对国内网络开放，
+    机房的 IP 段经常直接超时。先探一下就能把原因说清楚，不用等 ffmpeg 吐一堆
+    `Error number -138`。
+    """
+    import socket
+    from urllib.parse import urlparse
+
+    u = urlparse(url)
+    host = u.hostname
+    if not host:
+        return True, ""
+    port = u.port or (443 if u.scheme == "https" else 80)
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except OSError as e:
+        return False, f"{host} 域名解析失败：{e}"
+    addrs = []
+    for _fam, _t, _p, _c, sa in infos:
+        if sa[0] not in addrs:
+            addrs.append(sa[0])
+    if not addrs:
+        return False, f"{host} 没解析出任何地址"
+    last = ""
+    for ip in addrs[:max(1, tries)]:
+        try:
+            with socket.create_connection((ip, port), timeout=timeout):
+                return True, f"{host} → {ip}:{port}"
+        except OSError as e:
+            last = f"{ip}:{port} {e}"
+    return False, f"{host} 连不上（解析出 {len(addrs)} 个地址，最后试的 {last}）"
+
+
 def read_stderr_tail(proc, sink: list, keep: int = 40) -> None:
     """把 ffmpeg 的 stderr 收进 sink（只留最后 keep 行），在单独线程里跑。
 
@@ -876,6 +934,15 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
     log(f"清晰度 {quality}（{QUALITY_DESC.get(quality, '')}）")
     log(f"流地址 {url[:110]}...")
 
+    # 开录前先试连一下拉流服务器：本机能录、换台机器就录不了的，九成卡在这一步
+    reach_ok, reach_why = check_stream_host(url)
+    if reach_ok:
+        log(f"拉流服务器连通：{reach_why}")
+    else:
+        log(f"[!] 这台机器连不上抖音的拉流服务器：{reach_why}")
+        log("    这不是 403/签名问题，是网络层根本连不上。抖音的拉流 CDN 基本只对国内 IP 开放，"
+            "云服务器 / 海外机房经常这样；要在这台机器上录，得走国内线路或加中转代理。")
+
     os.makedirs(a.dir, exist_ok=True)
 
     # 这一场直播 = 一个 B 站稿件：本场所有的分段都投成它的 P1/P2/P3…
@@ -1049,6 +1116,9 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
                     log("  ffmpeg 报错：")
                     for ln in err_tail[-6:]:
                         log("    " + ln[:180])
+                    hint = explain_net_error(err_tail)
+                    if hint:
+                        log(f"  → {hint}")
                 if protocol == "hls":     # hls 拉不到就回退 flv，抖音的 flv 直连更稳
                     protocol = "flv"
                     log("  换成 flv 协议再试")

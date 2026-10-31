@@ -97,8 +97,24 @@ def main() -> int:
     assert len(ticks) >= 2, f"7 秒里只刷了 {len(ticks)} 次「已写」：\n" + "\n".join(LOGS)
     assert "已录 00:00:0" in ticks[0], ticks[0]
 
+    # ---- ④ 错误码翻人话 + 拉流服务器连通性预检
+    assert "连接超时" in rec.explain_net_error(
+        ["[tcp @ 0] Connection to tcp://x:80 failed: Error number -138 occurred"])
+    assert rec.explain_net_error(["HTTP error 403 Forbidden"]) == ""
+
+    import socket
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    ok, why = rec.check_stream_host(f"http://127.0.0.1:{port}/a.flv", timeout=2)
+    assert ok, why
+    srv.close()
+    ok2, why2 = rec.check_stream_host("http://127.0.0.1:1/a.flv", timeout=1)
+    assert not ok2, why2
+
     shutil.rmtree(tmp, ignore_errors=True)
-    print("OK：ffmpeg 报错能看见、残片会删、停止后不再开新文件、已写每 3 秒刷新")
+    print("OK：ffmpeg 报错能看见/翻译、残片会删、停止后不再开新文件、已写每 3 秒刷新、拉流预检")
     return 0
 
 
