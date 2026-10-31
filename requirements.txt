@@ -9,5 +9,6 @@ qrcode-terminal>=0.8
 # 装 httpx 或 aiohttp 也可以。
 curl_cffi>=0.7.0
 
-# 界面（圆角卡片 / 扁平按钮 / 深浅色）。这个是硬依赖：界面整个是它画的。
-customtkinter>=6.0
+# 界面：PySide6 + Fluent Widgets（Win11 风格）。这俩是硬依赖，界面整个是它们画的。
+PySide6>=6.6
+PySide6-Fluent-Widgets>=1.5
