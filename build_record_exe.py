@@ -105,6 +105,22 @@ def main() -> None:
         )
     print(f"打包用的解释器：{py}")
 
+    # ⚠️ 打包会先清空 dist/ —— 如果用户正从 dist\RecorderUploader.exe 跑着录制，
+    #    删不掉（文件占用）会把后面整条打包流程搞崩，更糟的是可能动到他刚录出来的文件。
+    #    所以动手前先探一下：能写就说明没在跑，不能写就直接退出并说清楚。
+    _old = HERE / "dist" / f"{a.name}.exe"
+    if _old.exists():
+        try:
+            with _old.open("ab"):
+                pass
+        except OSError:
+            sys.exit(
+                f"\n{a.name}.exe 正在运行（{_old}），文件被占用，没法重新打包。\n"
+                "  · 先把程序关掉（录制中会先把当前段收尾）；\n"
+                "  · 另外别直接从 dist/ 目录跑它 —— 录制产物会和 exe 混在一起，"
+                "重新打包时容易误伤，建议拷到自己的目录再用。"
+            )
+
     shutil.rmtree(HERE / "build", ignore_errors=True)
     shutil.rmtree(HERE / "dist", ignore_errors=True)
 
