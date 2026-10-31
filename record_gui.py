@@ -483,7 +483,7 @@ class MainWindow(FluentWindow):
         """页面底色。qfluentwidgets 只给自己的控件上色，裸 QWidget 会跟系统调色板走
         （系统深色时就是黑底 + 浅色卡片，特别难看），所以这里显式刷一遍。"""
         bg = "#1e1e1e" if isDarkTheme() else "#f0f4f9"
-        for page in (self.record_page, self.upload_page, self.log_page):
+        for page in (self.record_page, self.upload_page, self.bot_page, self.log_page):
             page.setStyleSheet(f"#{page.objectName()}{{background:{bg};}}")
             page.setAutoFillBackground(True)
             # ScrollArea 的 viewport 是裸 QWidget，会跟系统调色板走 —— 不给它单独上色，

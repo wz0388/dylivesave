@@ -201,6 +201,22 @@ def main() -> int:
     assert body.get("message_reference", {}).get("message_id") == "REFIDX_ABC==", body
     assert body.get("msg_id") == "MSG9", body
 
+    # ---- 10e. 收到消息要能记进日志（界面上看得到所有消息）
+    logs = []
+    b5 = qb.QQBot(qb.BotConfig(app_id="a", client_secret="s", groups=["G1"]),
+                  log=logs.append, handler=handler)
+    b5._post = make_bot()._post  # 复用假 post
+    b5.sent = []
+
+    async def _fp(path, body):
+        b5.sent.append((path, body))
+        return {"code": 0}
+    b5._post = _fp
+    etype, payload = ev("#列表", eid="EVL", mid="MSGL")
+    payload["d"]["author"] = {"member_openid": "U9", "nickname": "张三"}
+    run(b5, etype, payload)
+    assert any("张三" in x and "#列表" in x and "群聊" in x for x in logs), logs
+
     # ---- 11. 界面侧：机器人指令真的能加/删主播
     test_gui()
 

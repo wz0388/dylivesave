@@ -333,6 +333,11 @@ class QQBot:
 
         content = (d.get("content") or "").strip()
         author = d.get("author") or {}
+        # 让界面（日志页）能看到机器人收到的每一条消息
+        who = (author.get("nickname") or author.get("user_openid")
+               or author.get("member_openid") or "?")
+        ch = "私聊" if etype == "C2C_MESSAGE_CREATE" else "群聊"
+        self.log(f"[收/{ch}] {who}: {content[:160]}")
         if etype == "C2C_MESSAGE_CREATE":
             target, user = ("user", author.get("user_openid") or ""), author.get("user_openid") or ""
             at = ""
