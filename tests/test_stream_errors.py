@@ -85,8 +85,20 @@ def main() -> int:
     assert res2 is None
     assert time.time() - t0 < 5, "停止之后还磨蹭"
 
+    # ---- ③ 「已写」要按 PROGRESS_INTERVAL（3 秒）刷新，不是以前的 15 秒
+    rec.fetch_room_streams = lambda rid, cookie=None: _streams()
+    _patch("import sys, time\n"
+           "f = open(r'{OUT}','wb')\n"
+           "for _ in range(14):\n"
+           "    f.write(b'x' * 1024); f.flush(); time.sleep(0.5)\n"
+           "sys.exit(0)\n")
+    _run(tmp)
+    ticks = [ln for ln in LOGS if "已写" in ln]
+    assert len(ticks) >= 2, f"7 秒里只刷了 {len(ticks)} 次「已写」：\n" + "\n".join(LOGS)
+    assert "已录 00:00:0" in ticks[0], ticks[0]
+
     shutil.rmtree(tmp, ignore_errors=True)
-    print("OK：ffmpeg 报错能看见、残片会删、停止后不再开新文件")
+    print("OK：ffmpeg 报错能看见、残片会删、停止后不再开新文件、已写每 3 秒刷新")
     return 0
 
 

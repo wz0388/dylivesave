@@ -67,6 +67,10 @@ WAIT_INTERVAL = 30
 #: 表现就是「一直在录、这一段的文件永远不结束」—— 靠这个阈值主动收掉它去重连。
 #: 设得太小会把主播自己的卡顿误判成断流（重连代价很小，只是多开一个分P）。
 STALL_SECONDS = 60
+#: 录制中「已写 xxx，已录 hh:mm:ss」多久报一次（秒）。
+#: 界面上同一个直播间只会保留最新一条（就地刷新），所以报得勤一点也不会刷屏；
+#: 这个频率同时决定 logs/gui.log 里的采样密度，3 秒够看出有没有卡住。
+PROGRESS_INTERVAL = 3
 #: 上一场录制结束多久内又开播，算**同一场直播**（内容接着投进同一个稿件）。
 #: 抖音偶尔会闪断重推流：下播几秒后又「开播」，其实是同一场 —— 分成两个视频就断片了。
 SESSION_JOIN_GAP = 180
@@ -978,7 +982,7 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
                     log(f"[!] {STALL_SECONDS} 秒没有新数据（断流了？），"
                         "主动结束这一段去重连")
                     break
-                if time.time() - last_report >= 15 and cur_size:
+                if time.time() - last_report >= PROGRESS_INTERVAL and cur_size:
                     # live=房间号：界面里这个房间的「已写」只留一条，就地刷新
                     log(f"  已写 {human(cur_size)}，已录 {fmt_hms(time.time() - seg_start)}",
                         live=f"rec:{rid}")
