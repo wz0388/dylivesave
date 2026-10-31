@@ -160,6 +160,8 @@ class RoomRow(QFrame):
         self.running = False
         self.rid = ""
         self.tag = ""
+        self.anchor = ""
+        self.mode = "idle"
         self.stop_event: threading.Event | None = None
         self.thread: threading.Thread | None = None
         self.season: dict | None = None
@@ -695,6 +697,10 @@ class MainWindow(FluentWindow):
         head.addWidget(self.lbl_bot_state)
         head.addSpacing(12)
         head.addWidget(CaptionLabel("启用"))
+        self.btn_bot_clear = PushButton("清空消息", card)
+        self.btn_bot_clear.setFixedWidth(88)
+        self.btn_bot_clear.clicked.connect(lambda: self.bot_log.clear())
+        head.addWidget(self.btn_bot_clear)
         self.sw_bot = SwitchButton()
         self.sw_bot.setOnText("开")
         self.sw_bot.setOffText("关")
@@ -811,6 +817,12 @@ class MainWindow(FluentWindow):
             "绑定：把机器人拉进群（或加好友），把「#绑定 绑定码」发过去 —— "
             "在群里发就绑到群，私聊发就绑到私聊，上面的 openid 会自动填好。\n"
             "管理：再发「#添加 房间号」「#删除 房间号」「#列表」「#状态」。"))
+        lay.addWidget(StrongBodyLabel("机器人消息（收到的 + 连接日志）"))
+        self.bot_log = TextEdit()
+        self.bot_log.setReadOnly(True)
+        self.bot_log.setFont(QFont("Consolas", 9))
+        self.bot_log.setFixedHeight(200)
+        lay.addWidget(self.bot_log)
 
     def _load_bot_ui(self) -> None:
         c = self.bot_cfg
@@ -927,7 +939,7 @@ class MainWindow(FluentWindow):
             qb.save_config(APP_DIR, self._read_bot_ui())
         except Exception:
             pass
-        self.append_log(f"[QQ] 已绑定{where}：{oid}（master={user or '未知'}）")
+        self._bot_append(f"已绑定{where}：{oid}（master={user or '未知'}）")
         return (f"绑定成功，以后的开播/投稿通知都发到{where}。\n"
                 "你是管理员（master），可以 @某人 发「#授权」让他也能管主播")
 
@@ -940,14 +952,14 @@ class MainWindow(FluentWindow):
             if oid in c.admins or oid in c.masters:
                 return "这个人本来就有权限"
             c.admins.append(oid)
-            self.append_log(f"[QQ] 已授权：{oid}")
+            self._bot_append(f"已授权：{oid}")
             return f"已授权：{oid}，他现在也能 #添加 / #删除 主播了"
         if oid in c.masters:
             return "master 的权限不能收回（换人请重新绑定）"
         if oid not in c.admins:
             return "这个人本来就没有权限"
         c.admins.remove(oid)
-        self.append_log(f"[QQ] 已取消授权：{oid}")
+        self._bot_append(f"已取消授权：{oid}")
         return f"已取消授权：{oid}"
 
     def _on_unbind(self, kind: str, oid: str) -> str:
@@ -965,7 +977,7 @@ class MainWindow(FluentWindow):
             qb.save_config(APP_DIR, self._read_bot_ui())
         except Exception:
             pass
-        self.append_log(f"[QQ] 已解绑：{oid}")
+        self._bot_append(f"已解绑：{oid}")
         return "已解绑，不再往这里发通知"
 
     def _on_bot_log(self, text: str) -> None:
@@ -977,7 +989,15 @@ class MainWindow(FluentWindow):
                 self.lbl_bot_stats.setText(
                     f"收到 {st['events']} 条 · 指令 {st['commands']} · 发出 {st['sent']}")
             return
-        self.append_log("[QQ] " + text)
+        self._bot_append(text)
+
+    def _bot_append(self, text: str) -> None:
+        """往机器人页的消息区追加一行（收到的消息 / 连接日志都放这儿）。"""
+        cur = QTextCursor(self.bot_log.document())
+        cur.movePosition(QTextCursor.MoveOperation.End)
+        cur.insertText(f"[{time.strftime('%H:%M:%S')}] {text}\n")
+        self.bot_log.setTextCursor(cur)
+        self.bot_log.ensureCursorVisible()
 
     # ---- 机器人指令 → 界面（跨线程：丢回 GUI 线程执行并等结果）
     def _ui_call(self, fn, timeout: float = 8.0):
@@ -1014,9 +1034,24 @@ class MainWindow(FluentWindow):
             return "现在的主播：\n" + "\n".join(lines)
 
         if cmd == "状态":
-            n = sum(1 for r in self.rows if r.running)
+            rec_n = 0
+            lines = []
+            for i, r in enumerate(self.rows, 1):
+                room = r.room.text().strip()
+                if r.running:
+                    name = r.anchor or room or str(r.rid or "?")
+                    rid = r.rid or room or "?"
+                    if r.mode == "recording":
+                        rec_n += 1
+                        st = "录制中"
+                    else:
+                        st = "监控中（等开播）"
+                    lines.append(f"#{i} {name}（{rid}）· {st}")
+                else:
+                    lines.append(f"#{i} {room or '（空）'}（{r.rid or room or '?'}）· 未在录")
             up = f"；后台上传 {self._up_pct}%" if self._up_chunks else ""
-            return f"{len(self.rows)} 个主播，{n} 路在录{up}\n{self.lbl_status.text()}"
+            head = f"{len(self.rows)} 个主播，{rec_n} 路录制中{up}"
+            return head + "\n" + "\n".join(lines)
 
         if cmd == "添加":
             parts = arg.split()
@@ -1064,6 +1099,32 @@ class MainWindow(FluentWindow):
         bot = getattr(self, "bot", None)
         if bot is not None:
             bot.notify(text)
+
+    def _status_from_log(self, line: str) -> None:
+        """从日志把每一路的状态区分成「录制中 / 监控中（等开播）」，顺便抓主播名。"""
+        for r in self.rows:
+            if not r.running:
+                continue
+            tag = f"[{r.tag or r.rid}]"
+            if not line.startswith(tag):
+                continue
+            body = line[len(tag):]
+            if "主播：" in body and "·" in body:
+                try:
+                    r.anchor = body.split("主播：", 1)[1].split("·")[0].strip()
+                except Exception:
+                    pass
+                r.mode = "recording"
+                r.set_state("● 录制中", "ok")
+            elif "开始录制 →" in body or "  已写 " in body:
+                r.mode = "recording"
+                r.set_state("● 录制中", "ok")
+            elif "进入监控状态" in body or "等主播开播" in body:
+                r.mode = "waiting"
+                r.set_state("● 监控中", "warn")
+            elif "秒后再拉一次" in body:
+                r.mode = "waiting"
+                r.set_state("● 等待开播", "warn")
 
     def _maybe_notify_from_log(self, text: str) -> None:
         """从日志里认「开播 / 下播」—— 录制线程的日志是现成的，不用改 record.py。"""
@@ -1250,6 +1311,7 @@ class MainWindow(FluentWindow):
         self._put(self.log_edit, line, kind, live)
         file_log(text)
         self._maybe_notify_from_log(text)
+        self._status_from_log(text)
 
     def up_log(self, text: str) -> None:
         line = f"[{time.strftime('%H:%M:%S')}] {text}"
@@ -1359,6 +1421,7 @@ class MainWindow(FluentWindow):
         for r in self.rows:
             if r.running and r.thread is not None and not r.thread.is_alive():
                 r.set_running(False)
+                r.mode = "idle"
                 r.set_state("● 已停止", "muted")
                 changed = True
         if changed:
@@ -1415,6 +1478,8 @@ class MainWindow(FluentWindow):
         tag = room if len(room) <= 14 else room[:14]
         row.rid = rid
         row.tag = tag
+        row.anchor = ""
+        row.mode = "waiting"
         row.stop_event = threading.Event()
         row.set_running(True)
         row.thread = threading.Thread(
@@ -1429,7 +1494,7 @@ class MainWindow(FluentWindow):
                 monitor=self.sw_monitor.isChecked()))
         row.thread.start()
         self.append_log(f"===== 开录 [{tag}] {rid} =====")
-        row.set_state("● 录制中", "ok")
+        row.set_state("● 等待开播", "warn")
         self._save_settings()
         self._sync_state()
         return True
