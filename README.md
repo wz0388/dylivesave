@@ -43,6 +43,15 @@ pip install -r requirements.txt
 
 双击 `RecorderUploader.exe`（或 `python record_gui.py`）。
 
+### 外观
+
+界面用 **Sun Valley 主题**（Win11 风格）：白色卡片式分组、扁平按钮、
+「全部开始」是强调色按钮。右下角有个 **「深色 / 浅色」** 按钮，点一下即时切换，
+选择记在 `record_gui.json` 里，下次打开还是这个。
+
+> 主题来自 `sv-ttk`（`requirements.txt` 里已列）。源码运行时**没装也能跑**，
+> 只是回到 ttk 默认那套灰扑扑的外观。exe 里已经打进去了。
+
 ### 主播列表：可以多个同时录
 
 主播列表里填几个就录几个，「全部开始」一次全起，一人一个后台线程，互不影响。

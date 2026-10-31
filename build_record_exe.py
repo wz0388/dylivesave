@@ -150,6 +150,8 @@ def main() -> None:
         # bilibili_api 的接口配置是 data/api/*.json，不 collect 就会漏，
         # 表现是「界面能开，一投稿就报错」
         "--collect-all", "bilibili_api",
+        # 界面主题（Sun Valley）：sv.tcl 是包里的数据文件，不 collect 就会退化成 ttk 默认外观
+        "--collect-data", "sv_ttk",
         "--hidden-import", "PIL.ImageTk",
         "--hidden-import", "qrcode_terminal",
         "--paths", str(HERE),

@@ -8,3 +8,6 @@ qrcode-terminal>=0.8
 # 「尚未安装第三方请求库」。curl_cffi 是它优先选的那个，也更不容易被风控；
 # 装 httpx 或 aiohttp 也可以。
 curl_cffi>=0.7.0
+
+# 界面主题（Windows 11 风格）。没装也能跑，只是回到 ttk 默认那套灰扑扑的外观。
+sv-ttk>=2.6
