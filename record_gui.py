@@ -425,6 +425,12 @@ class MainWindow(FluentWindow):
         self.timer.timeout.connect(self._tick)
         self.timer.start(500)
 
+        # 延迟删除：启动先清一次（上次没跑到期的），之后每 10 分钟一次
+        self._sweep_deletes()
+        self.sweep_timer = QTimer(self)
+        self.sweep_timer.timeout.connect(self._sweep_deletes)
+        self.sweep_timer.start(10 * 60 * 1000)
+
         file_log(f"界面启动 pid={os.getpid()} frozen={getattr(sys, 'frozen', False)} "
                  f"dir={APP_DIR} ui=qt")
 
@@ -622,10 +628,20 @@ class MainWindow(FluentWindow):
         h2 = QHBoxLayout(bottom)
         h2.setContentsMargins(0, 0, 0, 0)
         h2.setSpacing(12)
-        self.ck_delete = CheckBox("上传成功后删除本地视频（省硬盘，删了找不回来）")
+        self.ck_delete = CheckBox("上传成功后删除本地视频")
         self.ck_delete.toggled.connect(self.on_toggle_delete)
         h2.addWidget(self.ck_delete)
-        h2.addWidget(CaptionLabel("只删确认上传成功的那几个文件；没传上去的会留着补传"))
+        h2.addSpacing(10)
+        h2.addWidget(BodyLabel("延后"))
+        self.ed_delay = LineEdit()
+        self.ed_delay.setFixedWidth(64)
+        self.ed_delay.setPlaceholderText("0")
+        self.ed_delay.setToolTip("填小时数，比如 6 就是传完 6 小时后自动删；0 = 立刻删")
+        self.ed_delay.editingFinished.connect(self._save_delete_delay)
+        h2.addWidget(self.ed_delay)
+        h2.addWidget(BodyLabel("小时（0 = 立即）"))
+        h2.addSpacing(10)
+        h2.addWidget(CaptionLabel("只删确认上传成功的那几个文件；到点自动清，程序重启也不会漏"))
         h2.addStretch(1)
         lay.addWidget(bottom)
 
@@ -757,7 +773,7 @@ class MainWindow(FluentWindow):
         l5.setFixedWidth(96)
         h3.addWidget(l5)
         self.ed_admins = LineEdit()
-        self.ed_admins.setPlaceholderText("留空 = 群里任何人都能操作")
+        self.ed_admins.setPlaceholderText("授权出去的人；绑定的人（master）不用填，自动算")
         h3.addWidget(self.ed_admins, 1)
         lay.addWidget(r3)
 
@@ -867,6 +883,7 @@ class MainWindow(FluentWindow):
         self.bot = qb.QQBot(cfg, log=lambda t: self.bridge.botlog.emit(t),
                             handler=self._bot_command,
                             on_bind=self._on_bind, on_unbind=self._on_unbind,
+                            on_grant=self._on_grant,
                             on_status=lambda s: self.bridge.botlog.emit(f"[状态] {s}"))
         self.bot.start()
         self.lbl_bot_state.setText("启动中…")
@@ -887,11 +904,11 @@ class MainWindow(FluentWindow):
             pass
         self.append_log("[i] 绑定码已重新生成（旧的作废）")
 
-    def _on_bind(self, kind: str, oid: str) -> str:
+    def _on_bind(self, kind: str, oid: str, user: str = "") -> str:
         """机器人在群里/私聊里收到「#绑定 <码>」→ 回 GUI 线程记下来。"""
-        return self._ui_call(lambda: self._on_bind_ui(kind, oid))
+        return self._ui_call(lambda: self._on_bind_ui(kind, oid, user))
 
-    def _on_bind_ui(self, kind: str, oid: str) -> str:
+    def _on_bind_ui(self, kind: str, oid: str, user: str = "") -> str:
         c = self.bot_cfg
         if kind == "group":
             if oid not in c.groups:
@@ -901,14 +918,37 @@ class MainWindow(FluentWindow):
             if oid not in c.users:
                 c.users.append(oid)
             where = "这个私聊"
+        # 绑定的人是 master：天然能管主播，也能 @ 别人授权
+        if user and user not in c.masters:
+            c.masters.append(user)
         self.ed_groups.setText("，".join(c.groups))
         self.ed_users.setText("，".join(c.users))
         try:
             qb.save_config(APP_DIR, self._read_bot_ui())
         except Exception:
             pass
-        self.append_log(f"[QQ] 已绑定{where}：{oid}")
-        return f"绑定成功，以后的开播/投稿通知都发到{where}"
+        self.append_log(f"[QQ] 已绑定{where}：{oid}（master={user or '未知'}）")
+        return (f"绑定成功，以后的开播/投稿通知都发到{where}。\n"
+                "你是管理员（master），可以 @某人 发「#授权」让他也能管主播")
+
+    def _on_grant(self, oid: str, add: bool) -> str:
+        return self._ui_call(lambda: self._on_grant_ui(oid, add))
+
+    def _on_grant_ui(self, oid: str, add: bool) -> str:
+        c = self.bot_cfg
+        if add:
+            if oid in c.admins or oid in c.masters:
+                return "这个人本来就有权限"
+            c.admins.append(oid)
+            self.append_log(f"[QQ] 已授权：{oid}")
+            return f"已授权：{oid}，他现在也能 #添加 / #删除 主播了"
+        if oid in c.masters:
+            return "master 的权限不能收回（换人请重新绑定）"
+        if oid not in c.admins:
+            return "这个人本来就没有权限"
+        c.admins.remove(oid)
+        self.append_log(f"[QQ] 已取消授权：{oid}")
+        return f"已取消授权：{oid}"
 
     def _on_unbind(self, kind: str, oid: str) -> str:
         return self._ui_call(lambda: self._on_unbind_ui(kind, oid))
@@ -1461,8 +1501,38 @@ class MainWindow(FluentWindow):
             self.ck_delete.blockSignals(True)
             self.ck_delete.setChecked(bool(cfg.delete_after_upload))
             self.ck_delete.blockSignals(False)
+            self.ed_delay.setText(f"{float(cfg.delete_delay_hours or 0):g}")
         except Exception:
             pass
+
+    def _save_delete_delay(self) -> None:
+        """把「延后 x 小时」写回 bili.toml（和命令行共用同一份配置）。"""
+        raw = (self.ed_delay.text() or "").strip() or "0"
+        try:
+            hours = max(0.0, float(raw))
+        except ValueError:
+            InfoBar.warning("要填数字", "小时数只能填数字，比如 6 或 0.5",
+                            duration=4000, position=InfoBarPosition.TOP, parent=self)
+            self._load_delete_setting()
+            return
+        try:
+            bu.set_config_value("delete_delay_hours", f"{hours:g}")
+        except Exception as e:
+            InfoBar.error("写配置失败", f"bili.toml 没写进去：{e}", duration=5000,
+                          position=InfoBarPosition.TOP, parent=self)
+            return
+        self.ed_delay.setText(f"{hours:g}")
+        if self.uploader is not None:
+            self.uploader.reload_cfg()
+        self.append_log("[i] 上传成功后删除："
+                        + ("立即删" if hours <= 0 else f"延后 {hours:g} 小时"))
+
+    def _sweep_deletes(self) -> None:
+        """把到点的延迟删除清掉（启动时一次，之后每 10 分钟一次）。"""
+        try:
+            bu.sweep_delete_queue(self.append_log)
+        except Exception as e:
+            self.append_log(f"[!] 清理延迟删除出错：{type(e).__name__}: {e}")
 
     def on_toggle_delete(self, checked: bool) -> None:
         try:

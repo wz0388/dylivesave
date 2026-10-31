@@ -370,11 +370,15 @@ python record.py --bili-login
 
 ```toml
 delete_after_upload = false    # true = 投稿成功后删除本地录制文件
+delete_delay_hours = 0         # 0 = 立刻删；填 6 就是「传完 6 小时后自动删」
 ```
 
 界面上也有同一个开关：**「B 站投稿」那一栏的「上传成功后删除本地视频」**，
-勾选/取消会**直接写回 `bili.toml`**（GUI 和命令行共用同一份配置，不会出现两边不一致），
-正在跑的上传队列下一次上传就按新值执行。
+后面跟一个**「延后 x 小时」**输入框（0 = 立即）。勾选/改数都会**直接写回 `bili.toml`**
+（GUI 和命令行共用同一份配置，不会出现两边不一致），正在跑的上传队列下一次上传就按新值执行。
+
+「延后 x 小时」适合想留档回看几小时再清：到点由后台清理器删，文件排进
+`bili_delete_queue.json`，**程序关了重启也不会漏删**。
 
 删除是**保守**的，只在这几种情况下动手：
 
@@ -439,13 +443,15 @@ B 站要求封面必填且不接受空字符串，所以这帧是必须抽的；
 | 下播 | `【下播】主播已下播，正在收尾并投稿` |
 | 投稿完成 | `【投稿完成】#1 P1 李大霄` |
 | 投稿失败 | `【投稿失败】#2 P2 李大霄（可在面板点「补传」）` |
-| 指令 | `#添加 房间号 [清晰度]`、`#删除 房间号`（或 `#删除 #2` 按行号）、`#列表`、`#状态`、`#帮助`、`#绑定 绑定码`、`#解绑` |
+| 指令 | `#添加 房间号 [清晰度]`、`#删除 房间号`（或 `#删除 #2` 按行号）、`#列表`、`#状态`、`#帮助`、`#绑定 绑定码`、`#解绑`、`#授权 @某人`、`#取消授权 @某人` |
 
 ### 面板上的三个开关
 
 - **启用**：开才连网关；
 - **允许机器人操作**：关掉后机器人只能「看」（列表/状态），不能加删主播 —— 这就是「上下操作权限」；
-- **管理员 openid**：填了就只认这些人发来的管理指令（留空 = 群里任何人都能操作）。
+- **master / 授权**：在群里发 `#绑定` 的那个人自动成为 **master**（管理员）；master 可以
+  `#授权 @某人` / `#取消授权 @某人` 把权限发给别人。master 和被授权的人都能管理主播，
+  其它人发管理指令会被拒。
 
 ### 配置一次要做的三件事
 
@@ -483,8 +489,9 @@ B 站要求封面必填且不接受空字符串，所以这帧是必须抽的；
 | `bili_failed_uploads.json` | 投稿失败待补传的清单（**不进仓库**） |
 | `bili_season_pending.json` | 待加合集的稿件清单（审核中加不进去的会留在这儿重试，**不进仓库**） |
 | `qqbot.json` | QQ 机器人的 AppID/AppSecret 与目标 openid（**含密钥，不进仓库**） |
+| `bili_delete_queue.json` | 延迟删除队列（到点清理本地录播，**不进仓库**） |
 | `bili_sessions.json` | 场次 → 稿件（bvid）对照表：同一场直播的分片靠它追加成同一个视频的分P（**不进仓库**） |
-| `tests/` | 分P 归属 / 删除开关 / 进度日志 / 每行分段时间 / 断流看门狗 / 合集的离线自测（不联网、不真传）：`tests/test_multipart.py`、`test_uploader_queue.py`、`test_delete_after_upload.py`、`test_live_log.py`、`test_row_segment.py`、`test_stall_watchdog.py`、`test_season.py`、`test_stream_errors.py`、`test_qqbot.py` |
+| `tests/` | 分P 归属 / 删除开关 / 进度日志 / 每行分段时间 / 断流看门狗 / 合集的离线自测（不联网、不真传）：`tests/test_multipart.py`、`test_uploader_queue.py`、`test_delete_after_upload.py`、`test_live_log.py`、`test_row_segment.py`、`test_stall_watchdog.py`、`test_season.py`、`test_stream_errors.py`、`test_qqbot.py`、`test_delete_delay.py` |
 
 ### 关于 cookie.txt
 

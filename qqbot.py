@@ -55,6 +55,9 @@ class BotConfig:
     users: list[str] = field(default_factory=list)
     #: 面板上的「允许机器人操作」开关 + 谁能操作（留空 = 不限制）
     allow_manage: bool = True
+    #: 绑定的人（master）：群/私聊里发「#绑定」的那个，天然有管理权
+    masters: list[str] = field(default_factory=list)
+    #: master 授权出去的人
     admins: list[str] = field(default_factory=list)
     notify_live_on: bool = True
     notify_live_off: bool = True
@@ -89,6 +92,8 @@ def load_config(app_dir: Path) -> BotConfig:
     cfg.groups = [str(x).strip() for x in (cfg.groups or []) if str(x).strip()]
     cfg.users = [str(x).strip() for x in (cfg.users or []) if str(x).strip()]
     cfg.admins = [str(x).strip() for x in (cfg.admins or []) if str(x).strip()]
+    cfg.masters = [str(x).strip() for x in (getattr(cfg, "masters", None) or [])
+                   if str(x).strip()]
     return cfg
 
 
@@ -108,11 +113,13 @@ class QQBot:
     def __init__(self, cfg: BotConfig, *, log: Callable[[str], None] = print,
                  handler: Callable[[str, str, str], str] | None = None,
                  on_status: Callable[[str], None] | None = None,
-                 on_bind: Callable[[str, str], str] | None = None,
-                 on_unbind: Callable[[str, str], str] | None = None):
+                 on_bind: Callable[[str, str, str], str] | None = None,
+                 on_unbind: Callable[[str, str], str] | None = None,
+                 on_grant: Callable[[str, bool], str] | None = None):
         ensure_bind_code(cfg)
         self.on_bind = on_bind
         self.on_unbind = on_unbind
+        self.on_grant = on_grant
         self.cfg = cfg
         self.log = log
         self.handler = handler
@@ -352,7 +359,14 @@ class QQBot:
             await self._reply(target, at + "发「" + pref + "帮助」看看能做什么", d)
             return
 
-        reply = self._run_command(text, user, target)
+        mentions = []
+        for m in (d.get("mentions") or []):
+            oid = (m.get("openid") or m.get("member_openid")
+                   or m.get("user_openid") or m.get("id") or "")
+            if oid:
+                mentions.append({"openid": str(oid),
+                                 "nickname": m.get("nickname") or ""})
+        reply = self._run_command(text, user, target, mentions)
         self.stats["commands"] += 1
         await self._reply(target, at + reply, d)
 
@@ -366,7 +380,8 @@ class QQBot:
             self._seen.popitem(last=False)
         return False
 
-    def _run_command(self, text: str, user: str, target=("group", "")) -> str:
+    def _run_command(self, text: str, user: str, target=("group", ""),
+                     mentions: list | None = None) -> str:
         """解析指令 → 权限检查 → handler。返回给用户的一句话。"""
         parts = text.split()
         cmd = parts[0]
@@ -376,6 +391,7 @@ class QQBot:
                    "bind": "绑定", "unbind": "解绑"}
         cmd = aliases.get(cmd.lower(), cmd)
         p = self.cfg.prefix or "#"
+        mentions = mentions or []
 
         if cmd in ("帮助", "help"):
             return ("可用指令：\n"
@@ -384,6 +400,8 @@ class QQBot:
                     f"{p}添加 房间号 [清晰度] —— 添加主播\n"
                     f"{p}删除 房间号 —— 删除主播\n"
                     f"{p}绑定 绑定码 —— 把通知发到这里（码在电脑端面板）\n"
+                    f"{p}授权 @某人 —— 让他也能管主播（只有 master 能授权）\n"
+                    f"{p}取消授权 @某人 —— 收回权限\n"
                     f"{p}解绑 —— 不再往这里发\n"
                     f"{p}帮助 —— 就是这条")
 
@@ -399,13 +417,30 @@ class QQBot:
             kind, oid = target
             if not oid:
                 return "拿不到这个会话的 openid，绑定失败"
-            return self.on_bind(kind, oid)
+            return self.on_bind(kind, oid, user)
 
         if cmd in ("解绑", ):
             if self.on_unbind is None:
                 return "界面没接上"
             kind, oid = target
             return self.on_unbind(kind, oid)
+
+        if cmd in ("授权", "取消授权"):
+            if not self.cfg.masters:
+                return f"还没人绑定过机器人，先发「{p}绑定 绑定码」"
+            if user not in self.cfg.masters:
+                return "只有绑定机器人的那个人（master）能改权限"
+            if self.on_grant is None:
+                return "界面没接上，改不了"
+            # @ 的人在 mentions 里（可信）；没 @ 就把参数当 openid 手打（要求足够长）
+            cand = [m["openid"] for m in mentions if m["openid"] != user]
+            if cand:
+                oid = cand[0]
+            else:
+                oid = arg.strip()
+                if len(oid) < 8:
+                    return f"要 @ 一个人，或者直接发 openid：{p}授权 <openid>"
+            return self.on_grant(oid, cmd == "授权")
 
         if cmd in ("列表", "状态"):
             if self.handler is None:
@@ -415,8 +450,10 @@ class QQBot:
         if cmd in ("添加", "删除", "开始", "停止"):
             if not self.cfg.allow_manage:
                 return "管理员没在面板里打开「允许机器人操作」，现在只能看不能改"
-            if self.cfg.admins and user not in self.cfg.admins:
-                return "你没有操作权限（要加白名单，请在面板的机器人页里加你的 openid）"
+            gate = set(self.cfg.masters) | set(self.cfg.admins)
+            if gate and user not in gate:
+                return ("你没有操作权限（让绑定机器人的那个人 @你 发一次"
+                        f"「{p}授权」）")
             if self.handler is None:
                 return "界面没接上，暂时改不了"
             return self.handler(cmd, arg, user)
@@ -436,6 +473,11 @@ class QQBot:
         if msg_id:
             body["msg_id"] = msg_id
             body["msg_seq"] = seq
+        # 引用对方那条消息，客户端里就是「回复」的样子（ext 里是 ["msg_idx=xxx", ...]）
+        for item in ((d.get("message_scene") or {}).get("ext") or []):
+            if isinstance(item, str) and item.startswith("msg_idx="):
+                body["message_reference"] = {"message_id": item.split("=", 1)[1]}
+                break
         await self._post(self._target_path(target), body)
 
     async def _post(self, path: str, body: dict) -> dict:

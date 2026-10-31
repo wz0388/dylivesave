@@ -128,8 +128,8 @@ def main() -> int:
     b = make_bot()
     bound = []
 
-    def _bind(kind, oid):
-        bound.append((kind, oid))
+    def _bind(kind, oid, user=""):
+        bound.append((kind, oid, user))
         return f"绑定成功（{kind}）"
     b.on_bind = _bind
     assert qb.ensure_bind_code(b.cfg) == b.cfg.bind_code != ""
@@ -142,19 +142,19 @@ def main() -> int:
     # 群里绑定 → 记成 group/G1
     good = b.cfg.bind_code
     r = b._run_command(f"绑定 {good}", "U1", ("group", "G1"))
-    assert r.startswith("绑定成功") and bound == [("group", "G1")], (r, bound)
+    assert r.startswith("绑定成功") and bound == [("group", "G1", "U1")], (r, bound)
 
     # 私聊绑定 → 记成 user/U1
     bound.clear()
     b._run_command(f"绑定 {good}", "U1", ("user", "U1"))
-    assert bound == [("user", "U1")], bound
+    assert bound == [("user", "U1", "U1")], bound
 
     # 关掉「允许操作」也能绑定（绑定不算管理操作）
     b2 = make_bot(allow_manage=False)
     seen = []
-    b2.on_bind = lambda kind, oid: (seen.append((kind, oid)), "ok")[1]
+    b2.on_bind = lambda kind, oid, user="": (seen.append((kind, oid, user)), "ok")[1]
     b2._run_command(f"绑定 {b2.cfg.bind_code}", "U1", ("group", "G2"))
-    assert seen == [("group", "G2")], seen
+    assert seen == [("group", "G2", "U1")], seen
 
     # 解绑
     un = []
@@ -164,6 +164,42 @@ def main() -> int:
 
     # 没给码 → 只提示用法
     assert "用法" in b2._run_command("绑定", "U1", ("group", "G2"))
+
+    # ---- 10c. master 与授权：绑定的人天然是管理员，能 @ 别人授权
+    b3 = make_bot()
+    b3.cfg.masters = ["BOSS"]
+    b3.cfg.admins = []
+    CALLED.clear()
+    assert "没有操作权限" in b3._run_command("添加 123", "U2")
+    assert b3._run_command("添加 123", "BOSS") == "处理了：添加 123"
+
+    grants = []
+    b3.on_grant = lambda oid, add: (grants.append((oid, add)), "ok")[1]
+    # 非 master 授权被拒
+    assert "只有绑定" in b3._run_command("授权", "U2", ("group", "G1"),
+                                        [{"openid": "U3"}])
+    # master @ 别人 → 授权成功
+    assert b3._run_command("授权", "BOSS", ("group", "G1"),
+                           [{"openid": "U3"}]) == "ok"
+    assert grants == [("U3", True)], grants
+    # 被授权的人也能管主播
+    b3.cfg.admins.append("U3")
+    CALLED.clear()
+    assert b3._run_command("删除 123", "U3") == "处理了：删除 123"
+    # 取消授权
+    b3._run_command("取消授权", "BOSS", ("group", "G1"), [{"openid": "U3"}])
+    assert grants[-1] == ("U3", False)
+    # 既没 @ 也没 openid
+    assert "要 @ 一个人" in b3._run_command("授权", "BOSS")
+
+    # ---- 10d. 回复要「引用」对方那条消息
+    b4 = make_bot()
+    etype, payload = ev("#列表", eid="EV9", mid="MSG9")
+    payload["d"]["message_scene"] = {"ext": ["msg_idx=REFIDX_ABC=="]}
+    run(b4, etype, payload)
+    body = b4.sent[0][1]
+    assert body.get("message_reference", {}).get("message_id") == "REFIDX_ABC==", body
+    assert body.get("msg_id") == "MSG9", body
 
     # ---- 11. 界面侧：机器人指令真的能加/删主播
     test_gui()
@@ -207,8 +243,9 @@ def test_gui() -> None:
         # 绑定码：面板上有码，收到 #绑定 后 openid 自动填进配置
         code = w.ed_code.text()
         assert len(code) == 36 and code.count("-") == 4, code
-        r = w._on_bind_ui("group", "GROUP_OPENID_1")
+        r = w._on_bind_ui("group", "GROUP_OPENID_1", "MASTER_1")
         assert "绑定成功" in r and "GROUP_OPENID_1" in w.ed_groups.text(), r
+        assert w.bot_cfg.masters == ["MASTER_1"], w.bot_cfg.masters
         r = w._on_bind_ui("user", "USER_OPENID_1")
         assert "绑定成功" in r and "USER_OPENID_1" in w.ed_users.text(), r
         assert w._on_unbind_ui("group", "GROUP_OPENID_1") == "已解绑，不再往这里发通知"

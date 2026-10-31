@@ -119,6 +119,10 @@ part_title_template = "{time}-{end}"
 # ⚠️ 删了就找不回来 —— 想留着本地留档就别开。
 delete_after_upload = false
 
+# 上传成功后再等几小时才删（0 = 立刻删）。设成 6 就是「录完传完，6 小时后自动清理」，
+# 留着这半天方便自己回看/补传；到期后由后台清理器删，程序没开也不会漏（写进队列文件）。
+delete_delay_hours = 0
+
 cover_position = 0             # 封面取第几秒的画面；0 = 视频第一帧
 container = 'ts'               # ts = 直接传（B 站云端转码，推荐）；mp4 = 先无损转封装再传
 keep_mp4 = true                # container=mp4 时，转出来的 mp4 是否保留（原 ts 始终保留）
@@ -175,6 +179,8 @@ class BiliConfig:
     multi_part: bool = True
     part_title_template: str = DEFAULT_PART_TITLE
     delete_after_upload: bool = False
+    #: 上传成功后延后多少小时再删（0 = 立即删）
+    delete_delay_hours: float = 0.0
     base_dir: Path = APP_DIR
 
 
@@ -268,6 +274,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG) -> tuple[BiliConfig, bool]:
         multi_part=_as_bool(b.get("multi_part"), True),
         part_title_template=str(b.get("part_title_template") or DEFAULT_PART_TITLE),
         delete_after_upload=_as_bool(b.get("delete_after_upload"), False),
+        delete_delay_hours=float(b.get("delete_delay_hours") or 0),
         base_dir=base,
     )
     if cfg.container not in ("mp4", "ts"):
@@ -574,9 +581,15 @@ def delete_uploaded(paths: list[Path], cfg: BiliConfig, log: Callable = print) -
     调用点都在**确认投稿成功之后**，而且只传这次真正上传的那几个文件：
     被 min_size_mb 跳过的、超过 4GB 没传上去的文件不在此列 —— 它们要留着补传。
     删不掉只记一行日志，不影响投稿结果。
+
+    delete_delay_hours > 0 时**不立即删**，而是把文件排进延迟队列（见 schedule_delete），
+    到期由 sweep_delete_queue() 清 —— 这样录完还能回看几小时。
     """
     if not getattr(cfg, "delete_after_upload", False):
         return 0
+    delay = float(getattr(cfg, "delete_delay_hours", 0) or 0)
+    if delay > 0:
+        return schedule_delete(paths, delay, log)
     done = 0
     seen: set[str] = set()
     for p in paths:
@@ -597,6 +610,85 @@ def delete_uploaded(paths: list[Path], cfg: BiliConfig, log: Callable = print) -
             log(f"[i] 已删除本地文件（{mb:.0f} MB，上传成功）：{p.name}")
         except Exception as e:
             log(f"[!] 删除失败，文件还在：{p}（{type(e).__name__}: {e}）")
+    return done
+
+
+# ─────────────────── 延迟删除（录完 x 小时后自动清） ───────────────────
+DELETE_QUEUE_FILE = "bili_delete_queue.json"
+
+
+def delete_queue_path() -> Path:
+    return APP_DIR / DELETE_QUEUE_FILE
+
+
+def load_delete_queue() -> list[dict]:
+    try:
+        d = json.loads(delete_queue_path().read_text(encoding="utf-8"))
+        return [x for x in d if isinstance(x, dict) and x.get("path")]
+    except Exception:
+        return []
+
+
+def _save_delete_queue(items: list[dict]) -> None:
+    try:
+        delete_queue_path().write_text(
+            json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def schedule_delete(paths: list[Path], hours: float,
+                    log: Callable = print) -> int:
+    """把文件排进「到点就删」的队列，返回排进去的数量。
+
+    队列落盘（bili_delete_queue.json），所以程序关了、重启了也不会漏删；
+    重启后 sweep_delete_queue() 会把已经到期的清掉。
+    """
+    due = time.time() + max(0.0, float(hours)) * 3600
+    items = load_delete_queue()
+    have = {x["path"] for x in items}
+    n = 0
+    for p in paths:
+        p = Path(p)
+        if not p.is_file():
+            continue
+        key = str(p)
+        if key in have:
+            continue
+        items.append({"path": key, "due": due, "mb": p.stat().st_size / 1024 / 1024})
+        have.add(key)
+        n += 1
+        log(f"[i] 已安排 {hours:g} 小时后删除：{p.name}")
+    if n:
+        _save_delete_queue(items)
+    return n
+
+
+def sweep_delete_queue(log: Callable = print) -> int:
+    """把到期的删掉（没到期/文件不在的留着或丢掉），返回删了几个。"""
+    items = load_delete_queue()
+    if not items:
+        return 0
+    now = time.time()
+    left: list[dict] = []
+    done = 0
+    for it in items:
+        p = Path(it["path"])
+        if not p.is_file():
+            continue                       # 已经被删/移走了，从队列里消失
+        if float(it.get("due") or 0) > now:
+            left.append(it)
+            continue
+        try:
+            mb = p.stat().st_size / 1024 / 1024
+            p.unlink()
+            done += 1
+            log(f"[i] 到期自动删除：{p.name}（{mb:.0f} MB）")
+        except Exception as e:
+            log(f"[!] 到期删除失败：{p}（{type(e).__name__}: {e}）")
+            left.append(it)                # 下次再试
+    if done or len(left) != len(items):
+        _save_delete_queue(left)
     return done
 
 
