@@ -72,9 +72,9 @@ DURATION_CHOICES = [("不限（一直录到主播下播）", 0), ("1 小时", 36
 #: 状态文字的颜色（深浅色各一套；QLabel 的 stylesheet 只认具体色值）
 _STATE_COLORS = {
     "light": {"muted": "#6b7280", "ok": "#15803d", "warn": "#b45309",
-              "err": "#b91c1c"},
+              "info": "#2563eb", "err": "#b91c1c"},
     "dark": {"muted": "#9aa0a6", "ok": "#5cd39a", "warn": "#fbbf24",
-             "err": "#f87171"},
+             "info": "#60a5fa", "err": "#f87171"},
 }
 
 
@@ -1121,7 +1121,7 @@ class MainWindow(FluentWindow):
                 r.set_state("● 录制中", "ok")
             elif "进入监控状态" in body or "等主播开播" in body:
                 r.mode = "waiting"
-                r.set_state("● 监控中", "warn")
+                r.set_state("● 监控中", "info")
             elif "秒后再拉一次" in body:
                 r.mode = "waiting"
                 r.set_state("● 等待开播", "warn")
