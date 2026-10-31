@@ -207,6 +207,10 @@ recordings/
 ```
 
 - **断流会自动重连**，重连后写 `_part2.ts`，不覆盖前面的。
+- **拉不到流时会把 ffmpeg 的原话打出来**：`只录到 0.0 MB/6s，判断为没真正拉到流` 后面
+  跟着 `ffmpeg 报错：403 Forbidden` 这种，不用再猜是 403、404 还是超时；
+  这种几 KB 的残片会顺手删掉，不留在录制目录里。
+- **flv 连续两次拉不到会自动换 hls 地址**再试（反过来 hls 失败也换 flv）。
 - **断流卡死有看门狗**：断流时 ffmpeg 不一定退出（TCP 半开连接会一直卡在 read 上），
   文件不长了、进程还在 —— 看着就是「一直在录，这一段永远不结束，也永远不投稿」。
   所以录制线程自己盯着输出文件：**60 秒没有新数据**就判定断流，主动收掉 ffmpeg 去重连；
@@ -418,7 +422,7 @@ B 站要求封面必填且不接受空字符串，所以这帧是必须抽的；
 | `bili_failed_uploads.json` | 投稿失败待补传的清单（**不进仓库**） |
 | `bili_season_pending.json` | 待加合集的稿件清单（审核中加不进去的会留在这儿重试，**不进仓库**） |
 | `bili_sessions.json` | 场次 → 稿件（bvid）对照表：同一场直播的分片靠它追加成同一个视频的分P（**不进仓库**） |
-| `tests/` | 分P 归属 / 删除开关 / 进度日志 / 每行分段时间 / 断流看门狗 / 合集的离线自测（不联网、不真传）：`tests/test_multipart.py`、`test_uploader_queue.py`、`test_delete_after_upload.py`、`test_live_log.py`、`test_row_segment.py`、`test_stall_watchdog.py`、`test_season.py` |
+| `tests/` | 分P 归属 / 删除开关 / 进度日志 / 每行分段时间 / 断流看门狗 / 合集的离线自测（不联网、不真传）：`tests/test_multipart.py`、`test_uploader_queue.py`、`test_delete_after_upload.py`、`test_live_log.py`、`test_row_segment.py`、`test_stall_watchdog.py`、`test_season.py`、`test_stream_errors.py` |
 
 ### 关于 cookie.txt
 

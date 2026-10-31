@@ -219,6 +219,24 @@ def human(size):
     return f"{mb:.1f} MB" if mb < 1024 else f"{mb / 1024:.2f} GB"
 
 
+def read_stderr_tail(proc, sink: list, keep: int = 40) -> None:
+    """把 ffmpeg 的 stderr 收进 sink（只留最后 keep 行），在单独线程里跑。
+
+    为什么要收：拉不到流的时候 ffmpeg 退出得很快，屏幕上只有「只录到 0.0 MB/6s」，
+    真正的原因（403 Forbidden / 404 / 超时 / Invalid data）全在 stderr 里 ——
+    打包成 exe 后没有控制台，不接住就彻底看不见了。
+    """
+    try:
+        for raw in iter(proc.stderr.readline, b""):
+            line = raw.decode("utf-8", "replace").rstrip()
+            if line:
+                sink.append(line)
+                if len(sink) > keep:
+                    del sink[0:len(sink) - keep]
+    except Exception:
+        pass
+
+
 def probe(path, ffmpeg_dir=""):
     """用 ffprobe 报一下结果；没装就算了"""
     exe = "ffprobe"
@@ -907,8 +925,13 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
 
     base = ""
     file_no = 0
+    fail_streak = 0                  # 连续几次没拉到数据（用来换协议）
     try:
         while file_count < MAX_FILES:
+            if stop_event.is_set():
+                # 停止请求在两次重连之间也要立刻生效 —— 否则点了停止还会再开一个文件
+                stopped = True
+                break
             if deadline and time.time() >= deadline:
                 break
             if not segments or segments[-1]["closed"]:
@@ -925,7 +948,12 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
                 + (f"（{left}s{'，本段上限' if capped else ''}）" if left else "（Ctrl+C 停止）"))
             flags = ffmpeg_creationflags()   # frozen 时加 CREATE_NO_WINDOW，不弹黑框
             seg_start = time.time()
-            proc = subprocess.Popen(cmd, creationflags=flags)
+            err_tail: list[str] = []         # ffmpeg 的报错尾巴（拉不到流时打给用户看）
+            proc = subprocess.Popen(cmd, creationflags=flags,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.PIPE)
+            threading.Thread(target=read_stderr_tail, args=(proc, err_tail),
+                             daemon=True).start()
             last_report = time.time()
             last_size = -1
             last_growth = time.time()
@@ -1009,15 +1037,37 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
                 log(f"ffmpeg 退出码 {rc}，未开启重连，停止")
                 break
             if too_short:
-                log(f"只录到 {human(size)}/{secs:.0f}s，判断为没真正拉到流")
+                fail_streak += 1
+                log(f"只录到 {human(size)}/{secs:.0f}s，判断为没真正拉到流"
+                    + (f"（连续第 {fail_streak} 次）" if fail_streak > 1 else ""))
+                if err_tail:
+                    # ffmpeg 才是知道原因的：403 / 404 / 超时 / 流被 CDN 掐了 都会写在这
+                    log("  ffmpeg 报错：")
+                    for ln in err_tail[-6:]:
+                        log("    " + ln[:180])
                 if protocol == "hls":     # hls 拉不到就回退 flv，抖音的 flv 直连更稳
                     protocol = "flv"
-                    log("切换到 flv 协议重试")
+                    log("  换成 flv 协议再试")
+                elif fail_streak == 2:
+                    # flv 连续失败也换 hls 试试（可能是这台 CDN 的 flv 被封 / 地址失效）
+                    protocol = "hls"
+                    log("  flv 连不上，换 hls 地址再试")
+                try:
+                    # 这种几 KB 的残片没用，别留在录制目录里骗人
+                    if os.path.exists(out):
+                        os.unlink(out)
+                        log(f"  删掉这个没用的残片：{os.path.basename(out)}")
+                except Exception:
+                    pass
             elif stalled:
+                fail_streak = 0
                 log(f"{STALL_SECONDS} 秒没有新数据，按断流处理；5 秒后重连 …")
             else:
+                fail_streak = 0
                 log(f"ffmpeg 退出码 {rc}，可能是断流；5 秒后重连 …")
-            time.sleep(5)
+            if stop_event.wait(5):        # 等 5 秒，但点了停止就立刻走
+                stopped = True
+                break
             again = fetch_room_streams(rid, cookie=load_cookie())
             if not again.live:
                 log("重查发现主播已下播，停止")
