@@ -26,8 +26,8 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPixmap, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (QApplication, QFileDialog, QFrame, QHBoxLayout,
-                               QLabel, QListWidgetItem, QMessageBox, QVBoxLayout,
-                               QWidget)
+                               QLabel, QLineEdit, QListWidgetItem, QMessageBox,
+                               QVBoxLayout, QWidget)
 
 from qfluentwidgets import (BodyLabel, CaptionLabel, CardWidget, CheckBox, ComboBox,
                             FluentIcon as FIF, FluentWindow, InfoBar, InfoBarPosition,
@@ -52,6 +52,7 @@ if str(APP_DIR) not in sys.path:
 
 import record as rec                                    # noqa: E402
 import bili_uploader as bu                              # noqa: E402
+import qqbot as qb                                      # noqa: E402
 
 #: 界面设置（每个主播行、目录、主题…）
 SETTINGS = APP_DIR / "record_gui.json"
@@ -145,6 +146,8 @@ class Bridge(QObject):
     qhint = Signal(str, str)
     qdone = Signal(str)
     progress = Signal(int, str, int, str, int, int, str)
+    botlog = Signal(str)            # 机器人自己的日志（连接/断线/报错）
+    ui_call = Signal(object)        # 机器人线程要改界面时，把函数丢过来在 GUI 线程执行
 
 
 class RoomRow(QFrame):
@@ -390,6 +393,8 @@ class MainWindow(FluentWindow):
         self._live_blocks: dict[str, object] = {}
         self._login_dialog: LoginDialog | None = None
         self._pending_qr: dict | None = None
+        self.bot: qb.QQBot | None = None            # QQ 机器人（没启用时是 None）
+        self.bot_cfg = qb.load_config(APP_DIR)
 
         self.settings = self._read_settings()
 
@@ -401,6 +406,8 @@ class MainWindow(FluentWindow):
         self.bridge.qhint.connect(self._on_qhint)
         self.bridge.qdone.connect(self._on_qdone)
         self.bridge.progress.connect(self._on_upload_event)
+        self.bridge.botlog.connect(self._on_bot_log)
+        self.bridge.ui_call.connect(lambda fn: fn())
 
         self.setWindowTitle("抖音直播录制 → B 站投稿")
         # 不开 mica：它把系统壁纸透进窗口，深浅色一切换就会出现「深底浅字」的半成品
@@ -453,6 +460,10 @@ class MainWindow(FluentWindow):
         self._build_upload_card(self.up_lay)
         self.up_lay.addStretch(1)
 
+        self.bot_page, self.bot_lay = self._scroll_page("botPage", "机器人")
+        self._build_bot_page(self.bot_lay)
+        self.bot_lay.addStretch(1)
+
         self.log_page, self.log_lay = self._scroll_page("logPage", "录制日志")
         self.log_edit = TextEdit()
         self.log_edit.setReadOnly(True)
@@ -479,6 +490,7 @@ class MainWindow(FluentWindow):
     def _init_nav(self) -> None:
         self.addSubInterface(self.record_page, FIF.VIDEO, "录制")
         self.addSubInterface(self.upload_page, FIF.CLOUD, "上传")
+        self.addSubInterface(self.bot_page, FIF.ROBOT, "机器人")
         self.addSubInterface(self.log_page, FIF.DOCUMENT, "日志")
         self.navigationInterface.setExpandWidth(168)
         self.navigationInterface.setCollapsible(False)
@@ -659,6 +671,294 @@ class MainWindow(FluentWindow):
     def _toggle_uplog(self, on: bool) -> None:
         self.up_edit.setVisible(bool(on))
 
+
+    # ─────────────────── QQ 机器人 ───────────────────
+    def _build_bot_page(self, parent_lay) -> None:
+        card, lay, head = self._card(parent_lay, "QQ 机器人 · 通知 + 管理")
+        self.lbl_bot_state = CaptionLabel("未启用")
+        head.addWidget(self.lbl_bot_state)
+        head.addSpacing(12)
+        head.addWidget(CaptionLabel("启用"))
+        self.sw_bot = SwitchButton()
+        self.sw_bot.setOnText("开")
+        self.sw_bot.setOffText("关")
+        self.sw_bot.checkedChanged.connect(lambda _: self._apply_bot())
+        head.addWidget(self.sw_bot)
+
+        # --- 凭证
+        r1 = QWidget(card)
+        h1 = QHBoxLayout(r1)
+        h1.setContentsMargins(0, 0, 0, 0)
+        h1.setSpacing(10)
+        l1 = BodyLabel("AppID")
+        l1.setFixedWidth(76)
+        h1.addWidget(l1)
+        self.ed_appid = LineEdit()
+        h1.addWidget(self.ed_appid, 1)
+        l2 = BodyLabel("AppSecret")
+        l2.setFixedWidth(80)
+        h1.addWidget(l2)
+        self.ed_secret = LineEdit()
+        self.ed_secret.setEchoMode(QLineEdit.EchoMode.Password)
+        h1.addWidget(self.ed_secret, 1)
+        lay.addWidget(r1)
+
+        # --- 推到哪儿（openid，不是 QQ 号）
+        r2 = QWidget(card)
+        h2 = QHBoxLayout(r2)
+        h2.setContentsMargins(0, 0, 0, 0)
+        h2.setSpacing(10)
+        l3 = BodyLabel("群 openid")
+        l3.setFixedWidth(76)
+        h2.addWidget(l3)
+        self.ed_groups = LineEdit()
+        self.ed_groups.setPlaceholderText("多个用逗号隔开；先在群里 @ 一下机器人，从日志里抄")
+        h2.addWidget(self.ed_groups, 1)
+        l4 = BodyLabel("私聊 openid")
+        l4.setFixedWidth(88)
+        h2.addWidget(l4)
+        self.ed_users = LineEdit()
+        self.ed_users.setPlaceholderText("可选")
+        h2.addWidget(self.ed_users, 1)
+        lay.addWidget(r2)
+
+        # --- 谁能操作
+        r3 = QWidget(card)
+        h3 = QHBoxLayout(r3)
+        h3.setContentsMargins(0, 0, 0, 0)
+        h3.setSpacing(10)
+        h3.addWidget(BodyLabel("允许机器人操作"))
+        self.sw_manage = SwitchButton()
+        self.sw_manage.setOnText("允许")
+        self.sw_manage.setOffText("只读")
+        h3.addWidget(self.sw_manage)
+        h3.addSpacing(16)
+        l5 = BodyLabel("管理员 openid")
+        l5.setFixedWidth(96)
+        h3.addWidget(l5)
+        self.ed_admins = LineEdit()
+        self.ed_admins.setPlaceholderText("留空 = 群里任何人都能操作")
+        h3.addWidget(self.ed_admins, 1)
+        lay.addWidget(r3)
+
+        # --- 通知开关
+        r4 = QWidget(card)
+        h4 = QHBoxLayout(r4)
+        h4.setContentsMargins(0, 0, 0, 0)
+        h4.setSpacing(14)
+        self.ck_live_on = CheckBox("开播提醒")
+        self.ck_live_off = CheckBox("下播提醒")
+        self.ck_up_ok = CheckBox("投稿完成")
+        self.ck_up_fail = CheckBox("投稿失败")
+        for w in (self.ck_live_on, self.ck_live_off, self.ck_up_ok, self.ck_up_fail):
+            h4.addWidget(w)
+        h4.addStretch(1)
+        lay.addWidget(r4)
+
+        # --- 按钮 + 说明
+        r5 = QWidget(card)
+        h5 = QHBoxLayout(r5)
+        h5.setContentsMargins(0, 0, 0, 0)
+        h5.setSpacing(10)
+        self.btn_bot_save = PrimaryPushButton("保存并应用", r5)
+        self.btn_bot_save.clicked.connect(self._save_bot_ui)
+        h5.addWidget(self.btn_bot_save)
+        btn_stop = PushButton("断开", r5)
+        btn_stop.clicked.connect(lambda: (self.sw_bot.setChecked(False), self._apply_bot()))
+        h5.addWidget(btn_stop)
+        h5.addStretch(1)
+        self.lbl_bot_stats = CaptionLabel("")
+        h5.addWidget(self.lbl_bot_stats)
+        lay.addWidget(r5)
+
+        lay.addWidget(CaptionLabel(
+            "用法：把机器人拉进群，在群里 @它 发「#添加 房间号」「#删除 房间号」"
+            "「#列表」「#状态」。通知走主动消息，第一次先让机器人在群里收到一条消息，"
+            "把群 openid 抄到上面。"))
+
+    def _load_bot_ui(self) -> None:
+        c = self.bot_cfg
+        self.sw_bot.blockSignals(True)          # 回填开关别顺手把机器人启动一遍
+        self.ed_appid.setText(c.app_id)
+        self.ed_secret.setText(c.client_secret)
+        self.ed_groups.setText("，".join(c.groups))
+        self.ed_users.setText("，".join(c.users))
+        self.ed_admins.setText("，".join(c.admins))
+        self.sw_manage.setChecked(bool(c.allow_manage))
+        self.sw_bot.setChecked(bool(c.enabled))
+        self.ck_live_on.setChecked(c.notify_live_on)
+        self.ck_live_off.setChecked(c.notify_live_off)
+        self.ck_up_ok.setChecked(c.notify_upload_ok)
+        self.ck_up_fail.setChecked(c.notify_upload_fail)
+        self.sw_bot.blockSignals(False)
+
+    @staticmethod
+    def _split_ids(text: str) -> list[str]:
+        out = []
+        for part in (text or "").replace("，", ",").replace(" ", ",").split(","):
+            part = part.strip()
+            if part:
+                out.append(part)
+        return out
+
+    def _read_bot_ui(self) -> qb.BotConfig:
+        c = self.bot_cfg
+        c.app_id = self.ed_appid.text().strip()
+        c.client_secret = self.ed_secret.text().strip()
+        c.groups = self._split_ids(self.ed_groups.text())
+        c.users = self._split_ids(self.ed_users.text())
+        c.admins = self._split_ids(self.ed_admins.text())
+        c.allow_manage = self.sw_manage.isChecked()
+        c.enabled = self.sw_bot.isChecked()
+        c.notify_live_on = self.ck_live_on.isChecked()
+        c.notify_live_off = self.ck_live_off.isChecked()
+        c.notify_upload_ok = self.ck_up_ok.isChecked()
+        c.notify_upload_fail = self.ck_up_fail.isChecked()
+        return c
+
+    def _save_bot_ui(self) -> None:
+        cfg = self._read_bot_ui()
+        try:
+            qb.save_config(APP_DIR, cfg)
+        except Exception as e:
+            InfoBar.error("保存失败", str(e), duration=4000,
+                          position=InfoBarPosition.TOP, parent=self)
+            return
+        self.append_log(f"[i] 机器人配置已保存（{'启用' if cfg.enabled else '未启用'}，"
+                        f"{len(cfg.groups)} 个群 / {len(cfg.users)} 个私聊）")
+        self._apply_bot()
+
+    def _apply_bot(self) -> None:
+        """按当前界面设置启动/重启/停止机器人。"""
+        cfg = self._read_bot_ui()
+        if self.bot is not None:
+            try:
+                self.bot.stop()
+            except Exception:
+                pass
+            self.bot = None
+        if not cfg.enabled:
+            self.lbl_bot_state.setText("未启用")
+            return
+        if not cfg.app_id or not cfg.client_secret:
+            self.lbl_bot_state.setText("缺少 AppID / AppSecret")
+            return
+        self.bot = qb.QQBot(cfg, log=lambda t: self.bridge.botlog.emit(t),
+                            handler=self._bot_command,
+                            on_status=lambda s: self.bridge.botlog.emit(f"[状态] {s}"))
+        self.bot.start()
+        self.lbl_bot_state.setText("启动中…")
+
+    def _on_bot_log(self, text: str) -> None:
+        if text.startswith("[状态] "):
+            self.lbl_bot_state.setText(text[5:])
+            bot = self.bot
+            if bot is not None:
+                st = bot.stats
+                self.lbl_bot_stats.setText(
+                    f"收到 {st['events']} 条 · 指令 {st['commands']} · 发出 {st['sent']}")
+            return
+        self.append_log("[QQ] " + text)
+
+    # ---- 机器人指令 → 界面（跨线程：丢回 GUI 线程执行并等结果）
+    def _ui_call(self, fn, timeout: float = 8.0):
+        box: dict = {}
+        done = threading.Event()
+
+        def job():
+            try:
+                box["v"] = fn()
+            except Exception as e:                     # noqa: BLE001
+                box["v"] = f"出错了：{type(e).__name__}: {e}"
+            finally:
+                done.set()
+
+        self.bridge.ui_call.emit(job)
+        if not done.wait(timeout):
+            return "界面没响应（可能正在忙），稍后再试"
+        return box.get("v") or "（没有回复）"
+
+    def _bot_command(self, cmd: str, arg: str, user: str) -> str:
+        return self._ui_call(lambda: self._bot_command_ui(cmd, arg, user))
+
+    def _bot_command_ui(self, cmd: str, arg: str, user: str) -> str:
+        """在 GUI 线程里真正执行机器人指令。"""
+        if cmd == "列表":
+            if not self.rows:
+                return "还没添加主播"
+            lines = []
+            for i, r in enumerate(self.rows, 1):
+                room = r.room.text().strip() or "（空）"
+                flag = "  ● 录制中" if r.running else ""
+                season = f"  合集《{r.season['title']}》" if r.season else ""
+                lines.append(f"#{i} {room}{flag}{season}")
+            return "现在的主播：\n" + "\n".join(lines)
+
+        if cmd == "状态":
+            n = sum(1 for r in self.rows if r.running)
+            up = f"；后台上传 {self._up_pct}%" if self._up_chunks else ""
+            return f"{len(self.rows)} 个主播，{n} 路在录{up}\n{self.lbl_status.text()}"
+
+        if cmd == "添加":
+            parts = arg.split()
+            if not parts:
+                return "用法：添加 房间号 [清晰度]"
+            room = parts[0]
+            quality = parts[1] if len(parts) > 1 else ""
+            try:
+                rid = rec.parse_rid(room)
+            except SystemExit as e:
+                return f"解析不了这个直播间：{e}"
+            for r in self.rows:
+                if r.room.text().strip() and r.room.text().strip() == room:
+                    return f"{room} 已经在列表里了（第 {r.idx} 行）"
+            if quality and quality not in QUALITY_LABEL.values():
+                quality = ""
+            row = self.add_row(room, quality, "", None)
+            self.append_log(f"[i] QQ 机器人添加了主播：{rid} → 第 {row.idx} 行")
+            self._save_settings()
+            return (f"已添加：{room}（第 {row.idx} 行"
+                    + (f"，清晰度 {row.quality.currentText()}" if quality else "") + "）")
+
+        if cmd == "删除":
+            key = arg.strip().lstrip("#")
+            if not key:
+                return "用法：删除 房间号（或 删除 #2 按序号）"
+            target = None
+            for r in self.rows:
+                if key.isdigit() and r.idx == int(key):
+                    target = r
+                    break
+                if r.room.text().strip() == key or (r.rid and r.rid == key):
+                    target = r
+                    break
+            if target is None:
+                return f"没找到：{key}（发「列表」看看）"
+            who = target.room.text().strip() or f"第 {target.idx} 行"
+            self.del_row(target)
+            self.append_log(f"[i] QQ 机器人删除了主播：{who}")
+            return f"已删除：{who}"
+
+        return "这个指令我还不支持"
+
+    def _bot_notify(self, text: str) -> None:
+        bot = getattr(self, "bot", None)
+        if bot is not None:
+            bot.notify(text)
+
+    def _maybe_notify_from_log(self, text: str) -> None:
+        """从日志里认「开播 / 下播」—— 录制线程的日志是现成的，不用改 record.py。"""
+        cfg = self.bot_cfg
+        if "主播：" in text and "·" in text and cfg.notify_live_on:
+            try:
+                name = text.split("主播：", 1)[1].split("·")[0].strip()
+                title = text.split("·", 1)[1].strip()
+            except Exception:
+                return
+            self._bot_notify(f"【开播】{name}\n{title}")
+        elif "重查发现主播已下播" in text and cfg.notify_live_off:
+            self._bot_notify("【下播】主播已下播，正在收尾并投稿")
+
     # ─────────────────── 主题 ───────────────────
     def _on_theme_switch(self, dark: bool) -> None:
         setTheme(Theme.DARK if dark else Theme.LIGHT)
@@ -760,6 +1060,8 @@ class MainWindow(FluentWindow):
             self.add_row()
         self._load_delete_setting()
         self._load_failed_rows()
+        self._load_bot_ui()
+        self._apply_bot()
         self._check_login()
 
     def _save_settings(self) -> None:
@@ -828,6 +1130,7 @@ class MainWindow(FluentWindow):
             kind = "ok"
         self._put(self.log_edit, line, kind, live)
         file_log(text)
+        self._maybe_notify_from_log(text)
 
     def up_log(self, text: str) -> None:
         line = f"[{time.strftime('%H:%M:%S')}] {text}"
@@ -905,9 +1208,13 @@ class MainWindow(FluentWindow):
         elif phase == "ok":
             self._up_row(iid, seg, anchor, "✓ 已投稿", "100%")
             self._up_pct, self._up_chunks = 100, ""
+            if self.bot_cfg.notify_upload_ok:
+                self._bot_notify(f"【投稿完成】{seg} {anchor}".strip())
         elif phase == "fail":
             self._up_row(iid, seg, anchor, "✗ 失败（可补传）", "—")
             self._up_chunks = ""
+            if self.bot_cfg.notify_upload_fail:
+                self._bot_notify(f"【投稿失败】{seg} {anchor}（可在面板点「补传」）".strip())
         self._refresh_status()
 
     # ─────────────────── 状态 ───────────────────
@@ -1225,6 +1532,11 @@ class MainWindow(FluentWindow):
             for r in running:
                 if r.thread is not None:
                     r.thread.join(timeout=25)
+        if self.bot is not None:
+            try:
+                self.bot.stop()
+            except Exception:
+                pass
         self._save_settings()
         e.accept()
 
@@ -1265,6 +1577,13 @@ def selftest() -> int:
         from bilibili_api.utils.network import get_client
         return type(get_client()).__name__
     check("bilibili_api 请求客户端", check_http_client)
+
+    def check_bot():
+        import aiohttp
+        cfg = qb.BotConfig(app_id="", client_secret="")
+        bot = qb.QQBot(cfg, log=lambda *a: None)
+        return f"机器人模块可用（aiohttp {aiohttp.__version__}，{bot.status}）"
+    check("qqbot", check_bot)
 
     print("项目模块：")
     check("record.parse_rid", lambda: rec.parse_rid("live.douyin.com/yall1102"))

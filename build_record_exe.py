@@ -153,6 +153,7 @@ def main() -> None:
         # Fluent Widgets 的资源（图标/字体）在包里，不 collect 会缺图标
         "--collect-all", "qfluentwidgets",
         "--hidden-import", "PIL.ImageTk",
+        "--hidden-import", "aiohttp",          # qqbot 里是局部 import，静态分析看不到
         "--hidden-import", "qrcode_terminal",
         "--paths", str(HERE),
     ]
