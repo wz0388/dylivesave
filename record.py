@@ -613,6 +613,23 @@ class UploadWorker:
             self.log(f"[i] 第 {item['seq']} 段没有可投稿的文件（可能已被删除），跳过")
             self._notify(item["seq"], "fail", 0, label=label)
 
+    def protect_paths(self) -> set[str]:
+        """还在排队 / 待补传的文件路径 —— 延迟删除时要跳过它们，不然补传就没文件了。"""
+        out: set[str] = set()
+        try:
+            import bili_uploader as bu
+            with self.q.mutex:
+                pending = list(self.q.queue)
+            for it in list(pending) + list(self.failed):
+                for f in (it.get("files") or []):
+                    out.add(str(f))
+            for it in bu.load_failed():
+                for f in (it.get("files") or []):
+                    out.add(str(f))
+        except Exception:
+            pass
+        return out
+
     def retry_failed(self, log=None) -> int:
         """把投稿失败的稿件重新排队上传（界面「补传」按钮 / CLI --bili-retry）。
 
@@ -837,7 +854,7 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
                   out_dir=None, name="", ffmpeg="", wait=0, no_reconnect=False,
                   list_only=False, upload=True, bili_config="", force_bili=False,
                   no_bili=False, logf=None, stop_event=None,
-                  uploader=None, tag="", season=None):
+                  uploader=None, tag="", season=None, on_segment_done=None):
     """录制一个直播间，录完（可选）自动投稿。
 
     命令行和 GUI 共用这一份逻辑：
@@ -851,6 +868,8 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
       uploader     给了就在**每段录完的当下**交给后台上传（录制不等它）；
                    不传则退回「整场录完再一起传」
       season       这个主播选的合集（{"id","title","section_id"}）；建稿成功后自动加进去
+      on_segment_done  每段录完（文件写完整了）回调一次，参数是这一段的文件列表。
+                   和投稿**无关**：不投稿也照样回调 —— 界面用它做「录完 x 小时后删本地」。
 
     投稿粒度：**一次调用 = 一场直播 = 一个 B 站稿件**。这次调用里切出来的每一段
     都是该稿件的分P（P1/P2/…）；下播后主播再开播由 run_one_room 重新调一次本函数，
@@ -985,6 +1004,12 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
         这样后台上传时才知道该往稿件的第几个 P 上挂。
         没有后台队列就攒起来，等整场录完一起传（命令行单独用的老行为）。
         """
+        if on_segment_done is not None:
+            # 注意：和上传开关无关 —— 「录完 N 小时后删本地」是纯录制侧的事
+            try:
+                on_segment_done([str(x) for x in (seg.get("files") or [])])
+            except Exception as e:
+                log(f"[!] on_segment_done 回调出错：{type(e).__name__}: {e}")
         if not upload:
             return
         n = len(seg.get("files") or [])

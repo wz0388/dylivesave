@@ -83,7 +83,57 @@ def main() -> int:
     cfg, _ = bu.load_config(cfg_file)
     assert cfg.delete_after_upload is True and cfg.delete_delay_hours == 6, cfg
 
-    print("OK：开关/立即删/延迟排队/到期清理/队列落盘/配置读写 全部通过")
+    # ---- 8. 还要补传的文件到点也不删（保护名单）
+    f4 = tmp / "d.ts"
+    f4.write_bytes(b"x" * 1024)
+    bu.schedule_delete([f4], 0.001, QUIET)
+    time.sleep(1.2)                      # 0.001 小时 ≈ 3.6 秒，这里等不到；直接改 due
+    q = bu.load_delete_queue()
+    for it in q:
+        if it["path"] == str(f4):
+            it["due"] = time.time() - 1
+    bu._save_delete_queue(q)
+    assert bu.sweep_delete_queue(QUIET, protect={str(f4)}) == 0
+    assert f4.exists(), "在补传的文件被删了"
+    assert any(it["path"] == str(f4) for it in bu.load_delete_queue()), "保护时不该从队列里丢"
+    # 补传完了（不再保护）→ 下次清理删掉
+    assert bu.sweep_delete_queue(QUIET, protect=set()) == 1
+    assert not f4.exists()
+
+    # ---- 9. 界面侧的「录完 x 小时删本地」：和投稿无关
+    test_gui_hook(tmp)
+
+    print("OK：开关/立即删/延迟排队/到期清理/保护补传/队列落盘/配置读写 全部通过")
+
+
+def test_gui_hook(tmp: Path) -> None:
+    """界面把「录完 x 小时删本地」接到录制回调上（不上传也要按这个删）。"""
+    from PySide6.QtWidgets import QApplication
+    import record_gui as g
+
+    app = QApplication.instance() or QApplication([])
+    g.SETTINGS = Path(tempfile.mkdtemp()) / "record_gui.json"
+    w = g.MainWindow()
+    try:
+        f = tmp / "gui_seg.ts"
+        f.write_bytes(b"x" * 2048)
+
+        w.local_delete_hours = 0
+        w._on_segment_done([str(f)])
+        assert bu.load_delete_queue() == [], "0 小时不该排队"
+
+        w.local_delete_hours = 6
+        w._on_segment_done([str(f)])
+        q = bu.load_delete_queue()
+        assert any(it["path"] == str(f) for it in q), q
+        assert q[0]["due"] > time.time() + 5 * 3600, q
+        # 存盘能带上这个设置
+        w._save_settings()
+        import json as _json
+        saved = _json.loads(g.SETTINGS.read_text(encoding="utf-8"))
+        assert saved["local_delete_hours"] == 6, saved
+    finally:
+        w.close()
     print("   临时目录：", tmp)
     return 0
 

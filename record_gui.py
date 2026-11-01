@@ -596,6 +596,25 @@ class MainWindow(FluentWindow):
         h.addWidget(btn_open)
         lay.addWidget(row)
 
+        row2 = QWidget(card)
+        h3 = QHBoxLayout(row2)
+        h3.setContentsMargins(0, 0, 0, 0)
+        h3.setSpacing(10)
+        h3.addWidget(BodyLabel("录完"))
+        self.ed_local_delete = LineEdit()
+        self.ed_local_delete.setFixedWidth(64)
+        self.ed_local_delete.setPlaceholderText("0")
+        self.ed_local_delete.setToolTip(
+            "录完多少小时后删本地文件；0 = 不删。\n"
+            "和 B 站投稿无关 —— 不上传、纯本地留档也照样按这个清理。")
+        self.ed_local_delete.editingFinished.connect(self._save_local_delete)
+        h3.addWidget(self.ed_local_delete)
+        h3.addWidget(BodyLabel("小时后删除本地文件"))
+        h3.addSpacing(8)
+        h3.addWidget(CaptionLabel("0 = 不删；和投稿无关，还在排队补传的文件不会被删"))
+        h3.addStretch(1)
+        lay.addWidget(row2)
+
     def _build_wait_card(self, parent_lay) -> None:
         card, lay, head = self._card(parent_lay, "主播没开播时")
         row = QWidget(card)
@@ -1280,6 +1299,8 @@ class MainWindow(FluentWindow):
         self.ck_upload.setChecked(bool(d.get("upload", True)))
         self.sw_monitor.setChecked(bool(d.get("monitor", True)))
         self.sw_dark.setChecked(self.settings.get("theme") == "dark")
+        self.local_delete_hours = float(d.get("local_delete_hours") or 0)
+        self.ed_local_delete.setText(f"{self.local_delete_hours:g}")
         for r in rooms or [{}]:
             self.add_row(r.get("room", ""), r.get("quality", ""),
                          r.get("segment", ""), r.get("season"))
@@ -1304,6 +1325,7 @@ class MainWindow(FluentWindow):
                 "upload": self.ck_upload.isChecked(),
                 "monitor": self.sw_monitor.isChecked(),
                 "theme": "dark" if isDarkTheme() else "light",
+                "local_delete_hours": float(getattr(self, "local_delete_hours", 0) or 0),
             }, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
@@ -1543,7 +1565,8 @@ class MainWindow(FluentWindow):
                 segment=self._segment_seconds(row.segment.currentText()),
                 season=row.season, duration=self._duration_seconds(),
                 out_dir=str(out_dir), wait=self._wait_seconds(), upload=True,
-                monitor=self.sw_monitor.isChecked()))
+                monitor=self.sw_monitor.isChecked(),
+                on_segment_done=self._on_segment_done))
         row.thread.start()
         self.append_log(f"===== 开录 [{tag}] {rid} =====")
         row.set_state("● 等待开播", "warn")
@@ -1644,10 +1667,40 @@ class MainWindow(FluentWindow):
         self.append_log("[i] 上传成功后删除："
                         + ("立即删" if hours <= 0 else f"延后 {hours:g} 小时"))
 
+    def _save_local_delete(self) -> None:
+        """「录完 x 小时删本地」——纯录制侧设置，和投稿无关。"""
+        raw = (self.ed_local_delete.text() or "").strip() or "0"
+        try:
+            hours = max(0.0, float(raw))
+        except ValueError:
+            InfoBar.warning("要填数字", "小时数只能填数字，比如 6 或 0.5",
+                            duration=4000, position=InfoBarPosition.TOP, parent=self)
+            hours = getattr(self, "local_delete_hours", 0.0)
+        self.local_delete_hours = hours
+        self.ed_local_delete.setText(f"{hours:g}")
+        self._save_settings()
+        self.append_log("[i] 录完自动删本地："
+                        + ("不删" if hours <= 0 else f"{hours:g} 小时后删"))
+
+    def _on_segment_done(self, files: list[str]) -> None:
+        """某一段录完了（录制线程回调）：按设置排进延迟删除。
+
+        ⚠️ 这里在录制线程里，只能做纯 Python 的事（写队列文件 / 发信号），
+        不能碰 Qt 控件 —— 日志走 bridge。
+        """
+        hours = float(getattr(self, "local_delete_hours", 0) or 0)
+        if hours <= 0 or not files:
+            return
+        try:
+            bu.schedule_delete(files, hours, log=self._log_from_thread)
+        except Exception as e:
+            self._log_from_thread(f"[!] 安排延迟删除失败：{type(e).__name__}: {e}")
+
     def _sweep_deletes(self) -> None:
         """把到点的延迟删除清掉（启动时一次，之后每 10 分钟一次）。"""
         try:
-            bu.sweep_delete_queue(self.append_log)
+            protect = self.uploader.protect_paths() if self.uploader else set()
+            bu.sweep_delete_queue(self.append_log, protect=protect)
         except Exception as e:
             self.append_log(f"[!] 清理延迟删除出错：{type(e).__name__}: {e}")
 

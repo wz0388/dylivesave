@@ -616,6 +616,7 @@ def delete_uploaded(paths: list[Path], cfg: BiliConfig, log: Callable = print) -
 
 # ─────────────────── 延迟删除（录完 x 小时后自动清） ───────────────────
 DELETE_QUEUE_FILE = "bili_delete_queue.json"
+_DELETE_LOCK = threading.Lock()      # 多个录制线程同时排/清，别写坏 json
 
 
 def delete_queue_path() -> Path:
@@ -646,37 +647,49 @@ def schedule_delete(paths: list[Path], hours: float,
     重启后 sweep_delete_queue() 会把已经到期的清掉。
     """
     due = time.time() + max(0.0, float(hours)) * 3600
-    items = load_delete_queue()
-    have = {x["path"] for x in items}
     n = 0
-    for p in paths:
-        p = Path(p)
-        if not p.is_file():
-            continue
-        key = str(p)
-        if key in have:
-            continue
-        items.append({"path": key, "due": due, "mb": p.stat().st_size / 1024 / 1024})
-        have.add(key)
-        n += 1
-        log(f"[i] 已安排 {hours:g} 小时后删除：{p.name}")
-    if n:
-        _save_delete_queue(items)
+    with _DELETE_LOCK:
+        items = load_delete_queue()
+        have = {x["path"] for x in items}
+        for p in paths:
+            p = Path(p)
+            if not p.is_file():
+                continue
+            key = str(p)
+            if key in have:
+                continue
+            items.append({"path": key, "due": due,
+                          "mb": p.stat().st_size / 1024 / 1024})
+            have.add(key)
+            n += 1
+            log(f"[i] 已安排 {hours:g} 小时后删除：{p.name}")
+        if n:
+            _save_delete_queue(items)
     return n
 
 
-def sweep_delete_queue(log: Callable = print) -> int:
-    """把到期的删掉（没到期/文件不在的留着或丢掉），返回删了几个。"""
+def sweep_delete_queue(log: Callable = print,
+                      protect: set[str] | None = None) -> int:
+    """把到期的删掉（没到期/文件不在的留着或丢掉），返回删了几个。
+
+    protect：这些路径先留着不删 —— 还在上传队列里、或者投稿失败要补传的文件
+    删了就没法补传了。界面每次清理时把「还在用的文件」传进来。
+    """
     items = load_delete_queue()
     if not items:
         return 0
     now = time.time()
     left: list[dict] = []
     done = 0
+    guard = {str(x) for x in (protect or set())}
     for it in items:
         p = Path(it["path"])
         if not p.is_file():
             continue                       # 已经被删/移走了，从队列里消失
+        if str(p) in guard:
+            log(f"[i] 到点了但这个文件还要传，先留着：{p.name}")
+            left.append(it)
+            continue
         if float(it.get("due") or 0) > now:
             left.append(it)
             continue
@@ -689,7 +702,8 @@ def sweep_delete_queue(log: Callable = print) -> int:
             log(f"[!] 到期删除失败：{p}（{type(e).__name__}: {e}）")
             left.append(it)                # 下次再试
     if done or len(left) != len(items):
-        _save_delete_queue(left)
+        with _DELETE_LOCK:
+            _save_delete_queue(left)
     return done
 
 
