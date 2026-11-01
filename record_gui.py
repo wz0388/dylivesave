@@ -1112,9 +1112,12 @@ class MainWindow(FluentWindow):
         return "这个指令我还不支持"
 
     def _bot_notify(self, text: str) -> None:
+        """所有推送统一带上当时的时间（年月日 时分秒），事后翻记录知道是什么时候的事。"""
         bot = getattr(self, "bot", None)
-        if bot is not None:
-            bot.notify(text)
+        if bot is None:
+            return
+        stamp = time.strftime("%m-%d %H:%M:%S")
+        bot.notify(f"[{stamp}] {text}")
 
     def _update_progress(self, live: str, text: str) -> None:
         """把「已写 x，已录 hh:mm:ss」刷新到对应那行的状态格（rec:{rid} → 那一行）。"""

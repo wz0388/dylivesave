@@ -12,6 +12,7 @@
 """
 import asyncio
 import sys
+from datetime import datetime
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent.parent
@@ -266,6 +267,24 @@ def test_gui() -> None:
         assert "绑定成功" in r and "USER_OPENID_1" in w.ed_users.text(), r
         assert w._on_unbind_ui("group", "GROUP_OPENID_1") == "已解绑，不再往这里发通知"
         assert "GROUP_OPENID_1" not in w.ed_groups.text()
+
+        # 通知要带时间戳（年月日 时分秒）
+        class _FakeBot:
+            def __init__(self):
+                self.msgs = []
+
+            def notify(self, t):
+                self.msgs.append(t)
+
+        fake = _FakeBot()
+        w.bot = fake
+        w._bot_notify("【开播】李大霄")
+        msg = fake.msgs[0]
+        # 形如「[11-01 10:45:41] 【开播】李大霄」：前缀能被 strptime 解析才算对
+        assert msg.endswith("【开播】李大霄"), msg
+        stamp = msg.split("] ")[0].lstrip("[")
+        datetime.strptime(stamp, "%m-%d %H:%M:%S")     # 格式不对会抛异常
+        w.bot = None
     finally:
         w.close()
         if not existed and cfg_file.exists():
