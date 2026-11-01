@@ -167,12 +167,15 @@ class RoomRow(QFrame):
         self.season: dict | None = None
         self.state_kind = "muted"
 
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 2, 0, 2)
-        lay.setSpacing(8)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 2, 0, 2)
+        outer.setSpacing(2)
+        lay = QHBoxLayout()
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
 
         self.no = CaptionLabel(f"#{idx}")
-        self.no.setFixedWidth(26)
+        self.no.setFixedWidth(22)
         lay.addWidget(self.no)
 
         self.room = LineEdit()
@@ -182,41 +185,54 @@ class RoomRow(QFrame):
 
         self.quality = ComboBox()
         self.quality.addItems([QUALITY_LABEL[q] for q in QUALITY_CHOICES])
-        self.quality.setFixedWidth(172)
+        self.quality.setFixedWidth(150)
         lay.addWidget(self.quality)
 
         self.segment = ComboBox()
         self.segment.addItems([s[0] for s in SEGMENT_CHOICES])
-        self.segment.setFixedWidth(146)
+        self.segment.setFixedWidth(150)
         lay.addWidget(self.segment)
 
         self.btn_season = PushButton("合集", self)
-        self.btn_season.setFixedWidth(86)
+        self.btn_season.setFixedWidth(80)
         self.btn_season.clicked.connect(lambda: app.pick_season(self))
         lay.addWidget(self.btn_season)
 
         self.btn_start = PrimaryPushButton("开始", self)
-        self.btn_start.setFixedWidth(64)
+        self.btn_start.setFixedWidth(60)
         self.btn_start.clicked.connect(lambda: app.start_row(self))
         lay.addWidget(self.btn_start)
 
         self.btn_stop = PushButton("停止", self)
-        self.btn_stop.setFixedWidth(64)
+        self.btn_stop.setFixedWidth(60)
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(lambda: app.stop_row(self))
         lay.addWidget(self.btn_stop)
-
-        self.state = CaptionLabel("● 未启动")
-        self.state.setFixedWidth(96)
-        lay.addWidget(self.state)
 
         self.btn_del = ToolButton(FIF.CLOSE, self)
         self.btn_del.setFixedSize(30, 30)
         self.btn_del.setToolTip("删除这一行（录制中也能删，只停这一路）")
         self.btn_del.clicked.connect(lambda: app.del_row(self))
         lay.addWidget(self.btn_del)
+        outer.addLayout(lay)
 
+        bottom = QHBoxLayout()
+        bottom.setContentsMargins(22, 0, 0, 0)
+        bottom.setSpacing(10)
+        self.state = CaptionLabel("● 未启动")
+        self.progress = CaptionLabel("")
+        self.progress.setFont(QFont("Microsoft YaHei UI", 9))
+        bottom.addWidget(self.state)
+        bottom.addWidget(self.progress, 1)
+        outer.addLayout(bottom)
+
+        self._progress = ""
         self.set_state("● 未启动", "muted")
+
+    def set_progress(self, text: str) -> None:
+        self._progress = (text or "").strip()
+        self.progress.setText(self._progress)
+        self.progress.setStyleSheet(f"color: {C('muted')};")
 
     def values(self) -> dict:
         return {
@@ -1100,6 +1116,26 @@ class MainWindow(FluentWindow):
         if bot is not None:
             bot.notify(text)
 
+    def _update_progress(self, live: str, text: str) -> None:
+        """把「已写 x，已录 hh:mm:ss」刷新到对应那行的状态格（rec:{rid} → 那一行）。"""
+        if not live.startswith("rec:"):
+            return
+        rid = live[4:]
+        try:
+            body = (text or "").strip()
+            if "已写" in body and "已录" in body:
+                written = body.split("已写", 1)[1].split("已录", 1)[0].strip(" ，,、")
+                elapsed = body.split("已录", 1)[1].strip(" ，,、")
+                disp = f"已写 {written} · 已录 {elapsed}"
+            else:
+                disp = body
+        except Exception:
+            disp = (text or "").strip()
+        for r in self.rows:
+            if r.running and str(r.rid) == rid:
+                r.set_progress(disp)
+                return
+
     def _status_from_log(self, line: str) -> None:
         """从日志把每一路的状态区分成「录制中 / 监控中（等开播）」，顺便抓主播名。"""
         for r in self.rows:
@@ -1145,6 +1181,7 @@ class MainWindow(FluentWindow):
         self._save_settings()
         for r in self.rows:
             r.set_state(r.state.text(), r.state_kind)
+            r.progress.setStyleSheet(f"color: {C('muted')};")
         for w in self.up_rows.values():
             w.update_row("", "", w.state.text(), w.pct.text())
         self._apply_page_bg()
@@ -1312,6 +1349,8 @@ class MainWindow(FluentWindow):
         file_log(text)
         self._maybe_notify_from_log(text)
         self._status_from_log(text)
+        if live:
+            self._update_progress(live, text)
 
     def up_log(self, text: str) -> None:
         line = f"[{time.strftime('%H:%M:%S')}] {text}"
@@ -1422,6 +1461,7 @@ class MainWindow(FluentWindow):
             if r.running and r.thread is not None and not r.thread.is_alive():
                 r.set_running(False)
                 r.mode = "idle"
+                r.set_progress("")
                 r.set_state("● 已停止", "muted")
                 changed = True
         if changed:
@@ -1480,6 +1520,7 @@ class MainWindow(FluentWindow):
         row.tag = tag
         row.anchor = ""
         row.mode = "waiting"
+        row.set_progress("")
         row.stop_event = threading.Event()
         row.set_running(True)
         row.thread = threading.Thread(
