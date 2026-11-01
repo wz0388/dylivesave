@@ -27,6 +27,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 from dataclasses import dataclass, field
@@ -1089,7 +1090,83 @@ async def _pick_client():
     return type(get_client()).__name__
 
 
-def _progress(log: Callable, progress_cb: Callable | None = None):
+#: 上传多久没进度算「卡住」（秒）。B 站分块是并发的，正常情况下每几秒就会有一块。
+STALL_SECONDS = 180
+#: 卡住后最多重传几次（每次都是从头重传，已传的那部分作废）
+STALL_RETRIES = 3
+#: 两次重传之间等多久（秒）
+STALL_RETRY_DELAY = 5
+
+
+class UploadStalled(BiliError):
+    """上传卡住了（长时间没有新分块），调用方应丢弃重传。"""
+
+
+class _StallGuard:
+    """盯着上传进度：STALL_SECONDS 秒没有新块就取消这次上传。
+
+    为什么要独立线程：bilibili_api 的上传是一个 await 到底的协程，
+    主线程卡在 asyncio.run() 里没法自己检查；另一个线程发现超时后
+    loop.call_soon_threadsafe(task.cancel()) 把协程取消掉。
+    """
+
+    def __init__(self, timeout: float = STALL_SECONDS,
+                 on_stall: Callable[[str], None] | None = None):
+        self.timeout = timeout
+        self.on_stall = on_stall
+        self.last = time.time()
+        self.done = -1
+        self._stop = threading.Event()
+        self._loop = None
+        self._task = None
+        self._fired = False
+        self._thread: threading.Thread | None = None
+
+    def touch(self, done: int) -> None:
+        """有新分块了：只有 done 变化才算进度（回调可能重复触发）。"""
+        if done != self.done:
+            self.done = done
+            self.last = time.time()
+
+    def idle_seconds(self) -> float:
+        return time.time() - self.last
+
+    def bind(self, loop, task) -> None:
+        self._loop, self._task = loop, task
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._watch, name="upload-stall",
+                                        daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _watch(self) -> None:
+        step = max(0.2, min(5.0, float(self.timeout) / 5))
+        while not self._stop.wait(step):
+            if self.idle_seconds() >= self.timeout:
+                self._fire()
+                return
+
+    def _fire(self) -> None:
+        if self._fired:
+            return
+        self._fired = True
+        if self.on_stall:
+            try:
+                self.on_stall(f"{int(self.timeout // 60)} 分钟没有进度")
+            except Exception:
+                pass
+        try:
+            if self._loop is not None and self._task is not None:
+                self._loop.call_soon_threadsafe(self._task.cancel)
+        except Exception:
+            pass
+
+
+def _progress(log: Callable, progress_cb: Callable | None = None,
+              guard: "_StallGuard | None" = None):
     """把库的分块事件换算成**整体进度百分比**。
 
     为什么不能直接用 chunk_number / total_chunk_count：
@@ -1119,6 +1196,8 @@ def _progress(log: Callable, progress_cb: Callable | None = None):
         total_chunks = total * len(pages)
         pct = min(100, int(done_chunks / total_chunks * 100)) if total_chunks else 0
         state["last"] = pct
+        if guard is not None:
+            guard.touch(done_chunks)
         if progress_cb is not None:
             try:
                 progress_cb(pct, done_chunks, total_chunks)
@@ -1134,7 +1213,8 @@ def _progress(log: Callable, progress_cb: Callable | None = None):
 
 async def _do_upload(paths: list[Path], page_titles: list[str], *, title: str, desc: str,
                      tid: int, tags: list[str], original: bool, no_reprint: bool,
-                     cover, cred, log: Callable, progress: Callable | None = None) -> dict:
+                     cover, cred, log: Callable, progress: Callable | None = None,
+                     guard: "_StallGuard | None" = None) -> dict:
     from bilibili_api import video_uploader
 
     pages = [video_uploader.VideoUploaderPage(path=str(p), title=t, description="")
@@ -1146,7 +1226,7 @@ async def _do_upload(paths: list[Path], page_titles: list[str], *, title: str, d
     meta = video_uploader.VideoMeta(**kwargs)
     uploader = video_uploader.VideoUploader(pages=pages, meta=meta, credential=cred)
     uploader.add_event_listener(video_uploader.VideoUploaderEvents.AFTER_CHUNK.value,
-                                _progress(log, progress))
+                                _progress(log, progress, guard))
     result = await uploader.start()
     return result or {}
 
@@ -1156,7 +1236,8 @@ async def _do_append(bvid: str, paths: list[Path], *, cfg: BiliConfig, cred,
                      when: datetime | None = None, durs: list[float] | None = None,
                      multi: bool = True,
                      log: Callable = print,
-                     progress: Callable | None = None) -> dict:
+                     progress: Callable | None = None,
+                     guard: "_StallGuard | None" = None) -> dict:
     """往**已有稿件**追加分P。
 
     B 站没有「给已有稿件上传一个新分P」的接口，得自己拼两步：
@@ -1214,7 +1295,7 @@ async def _do_append(bvid: str, paths: list[Path], *, cfg: BiliConfig, cred,
                                 cover=Picture(), line=None)
     uploader.line = await vu._choose_line(vu.Lines.BDA2)
     uploader.add_event_listener(vu.VideoUploaderEvents.AFTER_CHUNK.value,
-                               _progress(log, progress))
+                               _progress(log, progress, guard))
     titles = part_titles(cfg, len(paths), seg_start=when or datetime.now(),
                          durs=durs, first_part=base + 1, anchor=anchor,
                          room_id=room_id, quality=quality)
@@ -1345,6 +1426,51 @@ def part_titles(cfg: BiliConfig, count: int, *, seg_start: datetime,
 
 
 
+def _run_upload_once(coro_factory, log: Callable):
+    """跑一次上传协程，带「卡住就取消」的看门狗。"""
+    guard = _StallGuard(on_stall=lambda why: log(
+        f"[!] 上传卡住：{why}，取消这次上传，丢弃已传的部分重新来"))
+
+    async def runner():
+        guard.bind(asyncio.get_running_loop(), asyncio.current_task())
+        guard.start()
+        try:
+            return await coro_factory(guard)
+        finally:
+            guard.stop()
+
+    try:
+        return asyncio.run(runner())
+    except asyncio.CancelledError as e:      # 被看门狗 cancel 掉
+        raise UploadStalled(f"{int(STALL_SECONDS // 60)} 分钟没有进度") from e
+    except Exception as e:
+        if guard._fired:                    # 取消过程中库又抛了别的，也算卡住
+            raise UploadStalled(f"{int(STALL_SECONDS // 60)} 分钟没有进度") from e
+        raise
+
+
+def _upload_with_retry(coro_factory, *, log: Callable,
+                       notify: Callable[[str], None] | None = None,
+                       what: str = "上传"):
+    """卡住就丢掉重传，最多 STALL_RETRIES 次；每次都从头传（旧进度作废）。"""
+    for attempt in range(1, STALL_RETRIES + 1):
+        try:
+            return _run_upload_once(coro_factory, log)
+        except UploadStalled as e:
+            log(f"[!] {what}卡住（{e}），第 {attempt}/{STALL_RETRIES} 次，准备重传")
+            if notify is not None:
+                try:
+                    notify(f"【上传卡住】{what} {e}，已丢弃重传"
+                           f"（第 {attempt}/{STALL_RETRIES} 次）")
+                except Exception:
+                    pass
+            if attempt >= STALL_RETRIES:
+                raise BiliError(
+                    f"{what}连续 {STALL_RETRIES} 次卡住，先不传了。"
+                    "已记到待补传清单，稍后点「补传」重试") from e
+            time.sleep(STALL_RETRY_DELAY)
+
+
 def upload_recording(
     files: list[Path | str],
     *,
@@ -1362,6 +1488,7 @@ def upload_recording(
     session: dict | None = None,
     part: int = 0,
     season: dict | int | None = None,
+    notify: Callable[[str], None] | None = None,
 ) -> dict | None:
     """把**一段录制文件**交上去：这场直播还没投过就建新稿，投过了就追加成分P。
 
@@ -1489,10 +1616,12 @@ def upload_recording(
             f"这 {len(to_upload)} 个文件追加为分P"
             + (f"（从 P{part} 起）" if part else ""))
         try:
-            added = asyncio.run(_do_append(
-                target, to_upload, cfg=cfg, cred=cred, anchor=anchor,
-                room_id=str(room_id), quality=quality, when=seg_when, durs=durs,
-                log=log, progress=progress))
+            added = _upload_with_retry(
+                lambda g: _do_append(
+                    target, to_upload, cfg=cfg, cred=cred, anchor=anchor,
+                    room_id=str(room_id), quality=quality, when=seg_when,
+                    durs=durs, log=log, progress=progress, guard=g),
+                log=log, notify=notify, what=f"第 {seg_index} 段")
         finally:
             _cleanup_mp4()
         pages = int((added or {}).get("pages") or 0)
@@ -1550,10 +1679,12 @@ def upload_recording(
     if multi:
         log(f"    这场直播后面的分片都会追加成这个稿件的分P")
     try:
-        result = asyncio.run(_do_upload(
-            to_upload, page_titles, title=title, desc=desc, tid=cfg.tid, tags=tags,
-            original=cfg.original, no_reprint=cfg.no_reprint,
-            cover=cover, cred=cred, log=log, progress=progress))
+        result = _upload_with_retry(
+            lambda g: _do_upload(
+                to_upload, page_titles, title=title, desc=desc, tid=cfg.tid,
+                tags=tags, original=cfg.original, no_reprint=cfg.no_reprint,
+                cover=cover, cred=cred, log=log, progress=progress, guard=g),
+            log=log, notify=notify, what=f"第 {seg_index} 段")
     finally:
         _cleanup_mp4()
     bvid = (result or {}).get("bvid")

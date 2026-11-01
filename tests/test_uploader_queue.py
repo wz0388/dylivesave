@@ -25,7 +25,7 @@ CALLS: list[dict] = []
 
 def _fake_upload(files, *, anchor, cfg, room_id="", live_title="", quality="",
                  ffmpeg="ffmpeg", when=None, seg_index=1, seg_total=1, log=print,
-                 progress=None, session=None, part=0, season=None):
+                 progress=None, session=None, part=0, season=None, notify=None):
     CALLS.append({"files": [Path(f).name for f in files],
                   "session": (session or {}).get("key"),
                   "part": part, "season": season})

@@ -364,6 +364,17 @@ python record.py --bili-login
 > 日志里会写清原因（`追加分P失败 …`），这一段会自动进待补传清单，
 > 过一会儿点「补传」就行。文件都还在本地，不会白传。
 
+### 上传卡住了会自动重传
+
+B 站上传偶尔会「卡在那儿不动」：连接没断、但分块不再增加，能一直挂到天荒地老。
+现在有看门狗盯着：
+
+- **3 分钟没有新分块** → 判定卡住，取消这次上传，**丢掉已传的部分从头重传**；
+- 同时发一条 QQ 通知（配了机器人的话）：`【上传卡住】第 2 段 3 分钟没有进度，已丢弃重传（第 1/3 次）`；
+- 最多重试 3 次；仍然卡住就记进待补传清单，之后点「补传」再试。
+
+进度是按「已完成的分块数」算的（不是百分比），所以大文件前期一直是 0% 也不会误判。
+
 ### 上传成功后删掉本地视频（可选）
 
 录播很占硬盘，投完之后本地那份就没用了。`bili.toml` 里：
@@ -491,7 +502,7 @@ B 站要求封面必填且不接受空字符串，所以这帧是必须抽的；
 | `qqbot.json` | QQ 机器人的 AppID/AppSecret 与目标 openid（**含密钥，不进仓库**） |
 | `bili_delete_queue.json` | 延迟删除队列（到点清理本地录播，**不进仓库**） |
 | `bili_sessions.json` | 场次 → 稿件（bvid）对照表：同一场直播的分片靠它追加成同一个视频的分P（**不进仓库**） |
-| `tests/` | 分P 归属 / 删除开关 / 进度日志 / 每行分段时间 / 断流看门狗 / 合集的离线自测（不联网、不真传）：`tests/test_multipart.py`、`test_uploader_queue.py`、`test_delete_after_upload.py`、`test_live_log.py`、`test_row_segment.py`、`test_stall_watchdog.py`、`test_season.py`、`test_stream_errors.py`、`test_qqbot.py`、`test_delete_delay.py` |
+| `tests/` | 分P 归属 / 删除开关 / 进度日志 / 每行分段时间 / 断流看门狗 / 合集的离线自测（不联网、不真传）：`tests/test_multipart.py`、`test_uploader_queue.py`、`test_delete_after_upload.py`、`test_live_log.py`、`test_row_segment.py`、`test_stall_watchdog.py`、`test_season.py`、`test_stream_errors.py`、`test_qqbot.py`、`test_delete_delay.py`、`test_upload_stall.py` |
 
 ### 关于 cookie.txt
 

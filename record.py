@@ -393,7 +393,7 @@ class UploadWorker:
     """
 
     def __init__(self, *, config_path="", force=False, no_bili=False,
-                 log=None, progress=None):
+                 log=None, progress=None, notify=None):
         """progress(seq, phase, pct)：上传事件回调，给界面刷「上传」分页用。
 
         phase：start（开始传）/ progress（进行中，pct=百分比）/ ok / fail。
@@ -403,6 +403,7 @@ class UploadWorker:
         self.no_bili = no_bili
         self._log = log or _module_log
         self._progress = progress          # 上传事件回调（界面用来刷上传分页）
+        self._on_notice = notify           # 需要弹 QQ 通知的事件（上传卡住等）
         self.q: queue.Queue = queue.Queue()
         self.results: list[dict] = []
         self.failed: list[dict] = []
@@ -586,7 +587,8 @@ class UploadWorker:
                 part=int(item.get("part") or 0),
                 season=item.get("season"),
                 progress=lambda pct, d, t: self._notify(
-                    item["seq"], "progress", pct, "", d, t, label))
+                    item["seq"], "progress", pct, "", d, t, label),
+                notify=self._on_notice)
         except Exception as e:
             self.log(f"[!] 第 {item['seq']} 段投稿失败：{type(e).__name__}: {e}")
             for line in bu.explain_network_error(e):

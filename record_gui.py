@@ -147,6 +147,7 @@ class Bridge(QObject):
     qdone = Signal(str)
     progress = Signal(int, str, int, str, int, int, str)
     botlog = Signal(str)            # 机器人自己的日志（连接/断线/报错）
+    notice = Signal(str)            # 需要推给 QQ 的事件（上传卡住等）
     ui_call = Signal(object)        # 机器人线程要改界面时，把函数丢过来在 GUI 线程执行
 
 
@@ -425,6 +426,7 @@ class MainWindow(FluentWindow):
         self.bridge.qdone.connect(self._on_qdone)
         self.bridge.progress.connect(self._on_upload_event)
         self.bridge.botlog.connect(self._on_bot_log)
+        self.bridge.notice.connect(self._on_bot_notice)
         self.bridge.ui_call.connect(lambda fn: fn())
 
         self.setWindowTitle("抖音直播录制 → B 站投稿")
@@ -1007,6 +1009,11 @@ class MainWindow(FluentWindow):
             return
         self._bot_append(text)
 
+    def _on_bot_notice(self, text: str) -> None:
+        """上传卡住之类的事件：机器人页记一笔，同时推 QQ。"""
+        self._bot_append(text)
+        self._bot_notify(text)
+
     def _bot_append(self, text: str) -> None:
         """往机器人页的消息区追加一行（收到的消息 / 连接日志都放这儿）。"""
         cur = QTextCursor(self.bot_log.document())
@@ -1483,7 +1490,8 @@ class MainWindow(FluentWindow):
                 log=lambda *a: self.bridge.uplog.emit(" ".join(map(str, a))),
                 progress=lambda seq, phase, pct, anchor="", done=0, total=0,
                                 label="": self.bridge.progress.emit(
-                                    seq, phase, pct, anchor, done, total, label))
+                                    seq, phase, pct, anchor, done, total, label),
+                notify=lambda text: self.bridge.notice.emit(text))
         self.uploader.no_bili = not self.ck_upload.isChecked()
         return self.uploader
 
