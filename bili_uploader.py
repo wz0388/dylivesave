@@ -1192,9 +1192,9 @@ class _StallGuard:
             pass
 
 
-def custom_cover(cfg: BiliConfig) -> Path | None:
-    """配置里指定的封面图；没配或文件不在就返回 None（退回抽帧）。"""
-    raw = str(getattr(cfg, "cover_file", "") or "").strip()
+def custom_cover(cfg: BiliConfig, override: str = "") -> Path | None:
+    """封面图：单场指定的 > 配置里的；都没有/文件不在返回 None（退回抽帧）。"""
+    raw = str(override or getattr(cfg, "cover_file", "") or "").strip()
     if not raw:
         return None
     p = Path(raw).expanduser()
@@ -1525,6 +1525,7 @@ def upload_recording(
     part: int = 0,
     season: dict | int | None = None,
     notify: Callable[[str], None] | None = None,
+    cover: str = "",
 ) -> dict | None:
     """把**一段录制文件**交上去：这场直播还没投过就建新稿，投过了就追加成分P。
 
@@ -1671,7 +1672,7 @@ def upload_recording(
     #       （建新稿必须给封面；追加分P 不动封面）
     from bilibili_api.utils.picture import Picture
     cover = None
-    mine = custom_cover(cfg)
+    mine = custom_cover(cfg, cover)
     if mine is not None:
         try:
             cover = Picture().from_file(str(mine))

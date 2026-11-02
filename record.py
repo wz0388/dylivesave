@@ -469,13 +469,14 @@ class UploadWorker:
         self._thread.start()
 
     def submit(self, seg: dict, *, rid, anchor, live_title, quality, ffmpeg,
-               session=None, part=1, season=None) -> None:
+               session=None, part=1, season=None, cover="") -> None:
         """把一个录完的分段交给后台上传（立刻返回，不阻塞录制）。
 
         session: 这一场直播的状态（LiveSession.state）。传了且 bili.toml 里
                  multi_part = true 时，同一场的每一段都会追加成**同一个稿件**的分P。
         part:    这一段从第几个分P 起算（1 起）。
         season:  建稿成功后要加入的合集（这个主播选的），追加分P 时不再重复加。
+        cover:   这个主播自己的封面图（空 = 用配置里的，再空就抽帧）。
         """
         files = list(seg.get("files") or [])
         if not files:
@@ -489,7 +490,7 @@ class UploadWorker:
                         quality=quality, ffmpeg=ffmpeg,
                         session=session,
                         session_key=str((session or {}).get("key") or ""),
-                        part=int(part or 0), season=season))
+                        part=int(part or 0), season=season, cover=cover))
         self.start()
         extra = ""
         if session:
@@ -552,6 +553,11 @@ class UploadWorker:
 
     def _run_one(self, item) -> None:
         label = self._label(item)
+        # 日志带上主播名：界面按 [名字] 把这条分到该主播自己的分页里
+        who = (item.get("anchor") or "").strip() or label
+
+        def log(*a):
+            self.log(f"[{who}]", *a)
         if not self._ensure_cfg():
             import bili_uploader as bu
             if self._cred_problem:
@@ -559,10 +565,10 @@ class UploadWorker:
                 self.failed.append(item)
                 bu.remember_failed(item, self._cred_problem)
                 self._notify(item["seq"], "fail", 0, item.get("anchor") or "", label=label)
-                self.log(f"[!] 第 {item['seq']} 段没传：{self._cred_problem}")
-                self.log(f"    已记到 {bu.failed_path().name}，重新登录后点「补传」即可")
+                log(f"[!] 第 {item['seq']} 段没传：{self._cred_problem}")
+                log(f"    已记到 {bu.failed_path().name}，重新登录后点「补传」即可")
             else:
-                self.log(f"[i] 第 {item['seq']} 段不投稿（原因见上面）")
+                log(f"[i] 第 {item['seq']} 段不投稿（原因见上面）")
             return
         import bili_uploader as bu
         # 多个主播共用一个节流器：B 站风控按账号算，短时间连投会被 406 拦下
@@ -576,41 +582,41 @@ class UploadWorker:
                 hint = f"（追加到 {item['session'].get('bvid') or '这场直播已有的稿件'}）"
             else:
                 hint = "（这场直播的第 1 段，会新建一个稿件）"
-        self.log(f"[i] 后台开始上传第 {item['seq']} 段：{len(item['files'])} 个文件{hint}")
+        log(f"[i] 后台开始上传第 {item['seq']} 段：{len(item['files'])} 个文件{hint}")
         try:
             info = bu.upload_recording(
                 item["files"], anchor=item["anchor"], cfg=self._cfg,
                 room_id=item["rid"], live_title=item["live_title"],
                 quality=item["quality"], ffmpeg=item["ffmpeg"],
                 when=item["start"], seg_index=item["seq"], seg_total=0,
-                log=self.log, session=item.get("session"),
+                log=log, session=item.get("session"),
                 part=int(item.get("part") or 0),
                 season=item.get("season"),
                 progress=lambda pct, d, t: self._notify(
                     item["seq"], "progress", pct, "", d, t, label),
-                notify=self._on_notice)
+                notify=self._on_notice, cover=item.get("cover") or "")
         except Exception as e:
-            self.log(f"[!] 第 {item['seq']} 段投稿失败：{type(e).__name__}: {e}")
+            log(f"[!] 第 {item['seq']} 段投稿失败：{type(e).__name__}: {e}")
             for line in bu.explain_network_error(e):
-                self.log("    " + line)
+                log("    " + line)
             self.failed.append(item)
             bu.remember_failed(item, f"{type(e).__name__}: {e}")
-            self.log(f"    已记到 {bu.failed_path().name}，点「补传」或下次启动时会再投")
+            log(f"    已记到 {bu.failed_path().name}，点「补传」或下次启动时会再投")
             self._notify(item["seq"], "fail", 0, item.get("anchor") or "", label=label)
             return
         bu.remove_failed(item)
         if info:
             self.results.append(info)
             if info.get("appended"):
-                self.log(f"[√] 第 {item['seq']} 段已追加为分P：{info['bvid']}"
+                log(f"[√] 第 {item['seq']} 段已追加为分P：{info['bvid']}"
                          f"（该稿件现在 {info.get('pages', '?')} P）")
             else:
-                self.log(f"[√] 第 {item['seq']} 段投稿完成：{info['bvid']}"
+                log(f"[√] 第 {item['seq']} 段投稿完成：{info['bvid']}"
                          + ("（新建的稿件，后面的分片都会追加到这里）"
                             if item.get("session") else ""))
             self._notify(item["seq"], "ok", 100, item.get("anchor") or "", label=label)
         else:
-            self.log(f"[i] 第 {item['seq']} 段没有可投稿的文件（可能已被删除），跳过")
+            log(f"[i] 第 {item['seq']} 段没有可投稿的文件（可能已被删除），跳过")
             self._notify(item["seq"], "fail", 0, label=label)
 
     def protect_paths(self) -> set[str]:
@@ -854,7 +860,8 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
                   out_dir=None, name="", ffmpeg="", wait=0, no_reconnect=False,
                   list_only=False, upload=True, bili_config="", force_bili=False,
                   no_bili=False, logf=None, stop_event=None,
-                  uploader=None, tag="", season=None, on_segment_done=None):
+                  uploader=None, tag="", season=None, on_segment_done=None,
+                  cover=""):
     """录制一个直播间，录完（可选）自动投稿。
 
     命令行和 GUI 共用这一份逻辑：
@@ -868,6 +875,7 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
       uploader     给了就在**每段录完的当下**交给后台上传（录制不等它）；
                    不传则退回「整场录完再一起传」
       season       这个主播选的合集（{"id","title","section_id"}）；建稿成功后自动加进去
+      cover        这一场用的封面图（空 = 用 bili.toml 里的 cover_file / 抽帧）
       on_segment_done  每段录完（文件写完整了）回调一次，参数是这一段的文件列表。
                    和投稿**无关**：不投稿也照样回调 —— 界面用它做「录完 x 小时后删本地」。
 
@@ -1017,7 +1025,8 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
             uploader.submit(seg, rid=rid, anchor=streams.anchor,
                             live_title=streams.title, quality=quality,
                             ffmpeg=ffmpeg, session=session.state,
-                            part=session.take_parts(n), season=season)
+                            part=session.take_parts(n), season=season,
+                            cover=cover)
         else:
             end_upload.append(seg)
 

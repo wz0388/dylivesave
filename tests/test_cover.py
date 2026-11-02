@@ -77,6 +77,24 @@ def test_gui(tmp: Path, cfg_file: Path) -> None:
         assert w.ed_cover.text() == ""
         cfg2, _ = bu.load_config()
         assert cfg2.cover_file == "" and bu.custom_cover(cfg2) is None
+
+        # ---- 每个主播自己的封面：写进 record_gui.json 的 rooms[].cover
+        import json as _json
+        row = w.rows[0]
+        row.room.setText("50141210842")
+        page = w.anchor_pages[id(row)]
+        page.set_cover(str(img))
+        assert row.cover == str(img), row.cover
+        saved = _json.loads(g.SETTINGS.read_text(encoding="utf-8"))
+        assert saved["rooms"][0]["cover"] == str(img), saved["rooms"][0]
+
+        # 主播分页：日志按 [房间号] 分流；上传进度落到自己页里
+        row.rid = row.tag = "50141210842"
+        row.anchor = "李大霄"          # 真实运行时是 _status_from_log 从日志里学到的
+        w.append_log("[50141210842] 主播：李大霄 · 测试", "")
+        w._on_upload_event(1, "progress", 30, "李大霄", 30, 100, "#1 P1")
+        assert "测试" in page.log_edit.toPlainText(), page.log_edit.toPlainText()
+        assert len(page.up_rows) == 1, page.up_rows
     finally:
         w.close()
 

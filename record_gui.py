@@ -163,6 +163,7 @@ class RoomRow(QFrame):
         self.tag = ""
         self.anchor = ""
         self.mode = "idle"
+        self.cover = ""           # 这个主播专属的封面（空 = 用全局/抽帧）
         self.stop_event: threading.Event | None = None
         self.thread: threading.Thread | None = None
         self.season: dict | None = None
@@ -186,7 +187,7 @@ class RoomRow(QFrame):
 
         self.quality = ComboBox()
         self.quality.addItems([QUALITY_LABEL[q] for q in QUALITY_CHOICES])
-        self.quality.setFixedWidth(150)
+        self.quality.setFixedWidth(162)
         lay.addWidget(self.quality)
 
         self.segment = ComboBox()
@@ -234,6 +235,9 @@ class RoomRow(QFrame):
         self._progress = (text or "").strip()
         self.progress.setText(self._progress)
         self.progress.setStyleSheet(f"color: {C('muted')};")
+        page = getattr(self.app, "anchor_pages", {}).get(id(self))
+        if page is not None:
+            page.set_progress(self._progress)
 
     def values(self) -> dict:
         return {
@@ -241,12 +245,16 @@ class RoomRow(QFrame):
             "quality": self.quality.currentText(),
             "segment": self.segment.currentText(),
             "season": self.season,
+            "cover": self.cover,
         }
 
     def set_state(self, text: str, kind: str = "muted") -> None:
         self.state_kind = kind
         self.state.setText(text)
         self.state.setStyleSheet(f"color: {C(kind)};")
+        page = getattr(self.app, "anchor_pages", {}).get(id(self))
+        if page is not None:
+            page.set_state(text, kind)
 
     def set_season(self, season) -> None:
         self.season = season
@@ -261,6 +269,156 @@ class RoomRow(QFrame):
         self.segment.setEnabled(not running)
         self.btn_start.setEnabled(not running)
         self.btn_stop.setEnabled(running)
+
+
+
+class AnchorPage(QWidget):
+    """一个主播自己的分页：状态 + 封面 + 这个主播的日志 + 这个主播的上传进度。"""
+
+    def __init__(self, app, row):
+        super().__init__()
+        self.app = app
+        self.row = row
+        self._live: dict[str, object] = {}
+        self.up_rows: dict[str, UploadRow] = {}
+
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = ScrollArea()
+        scroll.setWidgetResizable(True)
+        holder = QWidget()
+        holder.setStyleSheet("background: transparent;")
+        lay = QVBoxLayout(holder)
+        lay.setContentsMargins(20, 10, 20, 20)
+        lay.setSpacing(10)
+
+        self.title = TitleLabel("主播")
+        lay.addWidget(self.title)
+
+        head = QWidget(holder)
+        h = QHBoxLayout(head)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(10)
+        self.state = CaptionLabel("● 未启动")
+        self.progress = CaptionLabel("")
+        h.addWidget(self.state)
+        h.addWidget(self.progress, 1)
+        lay.addWidget(head)
+
+        # ---- 这个主播专属的封面（留空就用全局的）
+        cover_row = QWidget(holder)
+        hc = QHBoxLayout(cover_row)
+        hc.setContentsMargins(0, 0, 0, 0)
+        hc.setSpacing(10)
+        lb = BodyLabel("封面")
+        lb.setFixedWidth(40)
+        hc.addWidget(lb)
+        self.ed_cover = LineEdit()
+        self.ed_cover.setPlaceholderText("留空 = 用全局封面 / 抽视频第一帧")
+        self.ed_cover.setClearButtonEnabled(True)
+        self.ed_cover.editingFinished.connect(self._cover_changed)
+        hc.addWidget(self.ed_cover, 1)
+        b1 = PushButton("选择图片", cover_row)
+        b1.clicked.connect(lambda: app.pick_anchor_cover(row))
+        hc.addWidget(b1)
+        b2 = PushButton("用全局", cover_row)
+        b2.clicked.connect(lambda: app.clear_anchor_cover(row))
+        hc.addWidget(b2)
+        lay.addWidget(cover_row)
+
+        # ---- 这个主播的上传进度
+        lay.addWidget(StrongBodyLabel("上传进度"))
+        self.up_box = QWidget(holder)
+        self.up_lay = QVBoxLayout(self.up_box)
+        self.up_lay.setContentsMargins(0, 0, 0, 0)
+        self.up_lay.setSpacing(6)
+        lay.addWidget(self.up_box)
+
+        # ---- 这个主播的日志
+        lay.addWidget(StrongBodyLabel("日志"))
+        self.log_edit = TextEdit()
+        self.log_edit.setReadOnly(True)
+        self.log_edit.setFont(QFont("Consolas", 9))
+        self.log_edit.setMinimumHeight(320)
+        lay.addWidget(self.log_edit, 1)
+
+        scroll.setWidget(holder)
+        outer.addWidget(scroll)
+
+    # ---- 标题
+    def refresh_title(self) -> None:
+        name = self.row.anchor or self.row.room.text().strip() or "（空）"
+        text = f"#{self.row.idx} {name}"
+        if len(text) > 16:
+            text = text[:15] + "…"
+        self.title.setText(text)
+        try:                                # 左边导航上的名字也跟着变
+            item = self.app.navigationInterface.widget(self.objectName())
+            if item is not None and hasattr(item, "setText"):
+                item.setText(text)
+        except Exception:
+            pass
+
+    # ---- 封面
+    def _cover_changed(self) -> None:
+        self.row.cover = self.ed_cover.text().strip()
+        self.app._save_settings()
+
+    def set_cover(self, path: str) -> None:
+        self.row.cover = path or ""
+        self.ed_cover.setText(self.row.cover)
+        self.app._save_settings()
+
+    # ---- 状态 / 进度
+    def set_state(self, text: str, kind: str = "muted") -> None:
+        self.state.setText(text)
+        self.state.setStyleSheet(f"color: {C(kind)};")
+
+    def set_progress(self, text: str) -> None:
+        self.progress.setText(text or "")
+
+    # ---- 日志（本页独立折叠「已写」）
+    def append_log(self, text: str, live: str = "") -> None:
+        line = f"[{time.strftime('%H:%M:%S')}] {text}"
+        kind = ""
+        if text.startswith("[!]") or "[x]" in text or "失败" in text:
+            kind = "warn"
+        elif text.startswith("[√]"):
+            kind = "ok"
+        fmt = QTextCharFormat()
+        if kind:
+            fmt.setForeground(QColor(C(kind)))
+        try:
+            blk = self._live.get(live) if live else None
+            if blk is not None and blk.isValid():
+                cur = QTextCursor(blk)
+                cur.setPosition(blk.position())
+                cur.setPosition(blk.position() + max(0, blk.length() - 1),
+                                QTextCursor.MoveMode.KeepAnchor)
+                cur.insertText(line, fmt)
+                self._live[live] = cur.block()
+            else:
+                cur = QTextCursor(self.log_edit.document())
+                cur.movePosition(QTextCursor.MoveOperation.End)
+                if self.log_edit.toPlainText():
+                    cur.insertBlock()
+                cur.insertText(line, fmt)
+                if live:
+                    self._live[live] = cur.block()
+            self.log_edit.setTextCursor(cur)
+            self.log_edit.ensureCursorVisible()
+        except Exception:
+            pass
+
+    # ---- 上传进度卡片
+    def up_row(self, iid: str, seg, anchor, state, pct) -> None:
+        w = self.up_rows.get(iid)
+        if w is None:
+            w = UploadRow(self.up_box)
+            self.up_lay.addWidget(w)
+            self.up_rows[iid] = w
+        w.update_row(seg, anchor, state, pct)
 
 
 class UploadRow(SimpleCardWidget):
@@ -405,7 +563,7 @@ class MainWindow(FluentWindow):
     def __init__(self):
         super().__init__()
         self.rows: list[RoomRow] = []
-        self.up_rows: dict[str, UploadRow] = {}
+
         self.uploader: rec.UploadWorker | None = None
         self._up_pct = 0
         self._up_chunks = ""
@@ -474,23 +632,19 @@ class MainWindow(FluentWindow):
         return page, lay
 
     def _init_pages(self) -> None:
-        self.record_page, self.rec_lay = self._scroll_page("recordPage", "录制")
+        self.record_page, self.rec_lay = self._scroll_page("recordPage", "总监控")
         self._build_rooms_card(self.rec_lay)
+        self._build_action_bar(self.rec_lay)
         self._build_common_card(self.rec_lay)
         self._build_wait_card(self.rec_lay)
         self._build_bili_card(self.rec_lay)
-        self._build_action_bar(self.rec_lay)
         self.rec_lay.addStretch(1)
-
-        self.upload_page, self.up_lay = self._scroll_page("uploadPage", "上传")
-        self._build_upload_card(self.up_lay)
-        self.up_lay.addStretch(1)
 
         self.bot_page, self.bot_lay = self._scroll_page("botPage", "机器人")
         self._build_bot_page(self.bot_lay)
         self.bot_lay.addStretch(1)
 
-        self.log_page, self.log_lay = self._scroll_page("logPage", "录制日志")
+        self.log_page, self.log_lay = self._scroll_page("logPage", "总日志")
         self.log_edit = TextEdit()
         self.log_edit.setReadOnly(True)
         self.log_edit.setFont(QFont("Consolas", 10))
@@ -499,11 +653,16 @@ class MainWindow(FluentWindow):
         self.status_label = CaptionLabel("● 就绪")
         self.log_lay.addWidget(self.status_label)
 
+        #: 每个主播一页（row → AnchorPage），add_row/del_row 里维护
+        self.anchor_pages: dict[int, AnchorPage] = {}
+
     def _apply_page_bg(self) -> None:
         """页面底色。qfluentwidgets 只给自己的控件上色，裸 QWidget 会跟系统调色板走
         （系统深色时就是黑底 + 浅色卡片，特别难看），所以这里显式刷一遍。"""
         bg = "#1e1e1e" if isDarkTheme() else "#f0f4f9"
-        for page in (self.record_page, self.upload_page, self.bot_page, self.log_page):
+        pages = [self.record_page, self.bot_page, self.log_page]
+        pages += [pg for pg in getattr(self, "anchor_pages", {}).values()]
+        for page in pages:
             page.setStyleSheet(f"#{page.objectName()}{{background:{bg};}}")
             page.setAutoFillBackground(True)
             # ScrollArea 的 viewport 是裸 QWidget，会跟系统调色板走 —— 不给它单独上色，
@@ -514,10 +673,10 @@ class MainWindow(FluentWindow):
                     f"QScrollArea>QWidget>QWidget{{background:{bg};}}")
 
     def _init_nav(self) -> None:
-        self.addSubInterface(self.record_page, FIF.VIDEO, "录制")
-        self.addSubInterface(self.upload_page, FIF.CLOUD, "上传")
+        self.addSubInterface(self.record_page, FIF.VIDEO, "总监控")
+        self.addSubInterface(self.log_page, FIF.DOCUMENT, "总日志")
         self.addSubInterface(self.bot_page, FIF.ROBOT, "机器人")
-        self.addSubInterface(self.log_page, FIF.DOCUMENT, "日志")
+        # 主播分页在 add_row 里动态加，排在后面
         self.navigationInterface.setExpandWidth(168)
         self.navigationInterface.setCollapsible(False)
 
@@ -719,32 +878,6 @@ class MainWindow(FluentWindow):
         self.lbl_status = CaptionLabel("● 就绪")
         h.addWidget(self.lbl_status)
         parent_lay.addWidget(bar)
-
-    def _build_upload_card(self, parent_lay) -> None:
-        card, lay, head = self._card(parent_lay, "上传进度")
-        head.addWidget(CaptionLabel("显示上传日志"))
-        self.sw_uplog = SwitchButton()
-        self.sw_uplog.setOnText("开")
-        self.sw_uplog.setOffText("关")
-        head.addWidget(self.sw_uplog)
-        self.sw_uplog.checkedChanged.connect(self._toggle_uplog)
-
-        self.up_box = QWidget(card)
-        self.up_lay_rows = QVBoxLayout(self.up_box)
-        self.up_lay_rows.setContentsMargins(0, 0, 0, 0)
-        self.up_lay_rows.setSpacing(6)
-        lay.addWidget(self.up_box)
-
-        self.up_edit = TextEdit()
-        self.up_edit.setReadOnly(True)
-        self.up_edit.setFont(QFont("Consolas", 9))
-        self.up_edit.setFixedHeight(170)
-        self.up_edit.hide()
-        lay.addWidget(self.up_edit)
-
-    def _toggle_uplog(self, on: bool) -> None:
-        self.up_edit.setVisible(bool(on))
-
 
     # ─────────────────── QQ 机器人 ───────────────────
     def _build_bot_page(self, parent_lay) -> None:
@@ -1164,6 +1297,27 @@ class MainWindow(FluentWindow):
         stamp = time.strftime("%m-%d %H:%M:%S")
         bot.notify(f"[{stamp}] {text}")
 
+    def _page_for(self, key: str):
+        """按 tag / 主播名 / 房间号 找这个主播的分页。"""
+        key = (key or "").strip()
+        if not key:
+            return None
+        for r in self.rows:
+            if key in (r.tag, r.anchor, str(r.rid)):
+                return self.anchor_pages.get(id(r))
+        return None
+
+    def _route_log(self, text: str) -> None:
+        """日志开头是 [房间号] / [主播名] 的，顺带写进那个主播自己的分页。"""
+        if not text.startswith("["):
+            return
+        end = text.find("]")
+        if end <= 1:
+            return
+        page = self._page_for(text[1:end])
+        if page is not None:
+            page.append_log(text)
+
     def _update_progress(self, live: str, text: str) -> None:
         """把「已写 x，已录 hh:mm:ss」刷新到对应那行的状态格（rec:{rid} → 那一行）。"""
         if not live.startswith("rec:"):
@@ -1200,6 +1354,9 @@ class MainWindow(FluentWindow):
                     pass
                 r.mode = "recording"
                 r.set_state("● 录制中", "ok")
+                pg = self.anchor_pages.get(id(r))
+                if pg is not None:
+                    pg.refresh_title()
             elif "开始录制 →" in body or "  已写 " in body:
                 r.mode = "recording"
                 r.set_state("● 录制中", "ok")
@@ -1230,22 +1387,36 @@ class MainWindow(FluentWindow):
         for r in self.rows:
             r.set_state(r.state.text(), r.state_kind)
             r.progress.setStyleSheet(f"color: {C('muted')};")
-        for w in self.up_rows.values():
-            w.update_row("", "", w.state.text(), w.pct.text())
+        for pg in getattr(self, "anchor_pages", {}).values():
+            pg.set_state(pg.state.text(), "muted" if "未启动" in pg.state.text() else "ok")
+            pg.progress.setStyleSheet(f"color: {C('muted')};")
         self._apply_page_bg()
         self._check_login()
 
     # ─────────────────── 主播行 ───────────────────
     def add_row(self, room: str = "", quality: str = "", segment: str = "",
-                season=None) -> RoomRow:
+                season=None, cover: str = "") -> RoomRow:
         row = RoomRow(self, len(self.rows) + 1)
         row.room.setText(room or "")
         row.quality.setCurrentText(_quality_label(quality))
         row.segment.setCurrentText(_segment_label(segment) if segment
                                    else self.cmb_segment.currentText())
         row.set_season(season)
+        row.cover = (cover or "").strip()
         self.rows_lay.addWidget(row)
         self.rows.append(row)
+
+        # 每个主播一个分页：自己的日志 + 自己的上传进度 + 自己的封面
+        page = AnchorPage(self, row)
+        page.setObjectName(f"anchorPage{id(row)}")
+        page.ed_cover.setText(row.cover)
+        page.refresh_title()
+        self.anchor_pages[id(row)] = page
+        title = f"#{row.idx} " + (room[:8] if room else "新主播")
+        self.addSubInterface(page, FIF.PEOPLE, title)
+        row.room.editingFinished.connect(page.refresh_title)
+        self._apply_page_bg()
+
         self._sync_state()
         return row
 
@@ -1261,12 +1432,22 @@ class MainWindow(FluentWindow):
                 row.stop_event.set()
             if row.thread is not None:
                 row.thread.join(timeout=25)
+        page = self.anchor_pages.pop(id(row), None)
+        if page is not None:
+            try:
+                self.removeInterface(page)
+            except Exception:
+                pass
+            page.deleteLater()
         row.setParent(None)
         row.deleteLater()
         self.rows.remove(row)
         for i, r in enumerate(self.rows, 1):
             r.idx = i
             r.no.setText(f"#{i}")
+            pg = self.anchor_pages.get(id(r))
+            if pg is not None:
+                pg.refresh_title()
         self._save_settings()
         self._sync_state()
 
@@ -1322,7 +1503,8 @@ class MainWindow(FluentWindow):
         self.ed_local_delete.setText(f"{self.local_delete_hours:g}")
         for r in rooms or [{}]:
             self.add_row(r.get("room", ""), r.get("quality", ""),
-                         r.get("segment", ""), r.get("season"))
+                         r.get("segment", ""), r.get("season"),
+                         r.get("cover", ""))
         if not self.rows:
             self.add_row()
         self._load_delete_setting()
@@ -1400,6 +1582,7 @@ class MainWindow(FluentWindow):
         file_log(text)
         self._maybe_notify_from_log(text)
         self._status_from_log(text)
+        self._route_log(text)
         if live:
             self._update_progress(live, text)
 
@@ -1410,7 +1593,9 @@ class MainWindow(FluentWindow):
             kind = "warn"
         elif text.startswith("[√]"):
             kind = "ok"
-        self._put(self.up_edit, line, kind, "")
+        if hasattr(self, "log_edit"):
+            self._put(self.log_edit, line, kind, "")
+        self._route_log(text)
         file_log(text)
 
     def _put(self, edit: TextEdit, line: str, kind: str, live: str) -> None:
@@ -1441,14 +1626,12 @@ class MainWindow(FluentWindow):
         except Exception:
             pass
 
-    # ─────────────────── 上传页 ───────────────────
+    # ─────────────────── 上传进度（挂到各自的主播页） ───────────────────
     def _up_row(self, iid: str, seg, anchor, state, pct) -> None:
-        w = self.up_rows.get(iid)
-        if w is None:
-            w = UploadRow(self.up_box)
-            self.up_lay_rows.addWidget(w)
-            self.up_rows[iid] = w
-        w.update_row(seg, anchor, state, pct)
+        page = self._page_for(anchor) if anchor else None
+        if page is None:
+            return                     # 认不出是谁的，只留在总日志里
+        page.up_row(iid, seg, anchor, state, pct)
 
     def _load_failed_rows(self) -> None:
         try:
@@ -1585,7 +1768,8 @@ class MainWindow(FluentWindow):
                 season=row.season, duration=self._duration_seconds(),
                 out_dir=str(out_dir), wait=self._wait_seconds(), upload=True,
                 monitor=self.sw_monitor.isChecked(),
-                on_segment_done=self._on_segment_done))
+                on_segment_done=self._on_segment_done,
+                cover=row.cover or ""))
         row.thread.start()
         self.append_log(f"===== 开录 [{tag}] {rid} =====")
         row.set_state("● 等待开播", "warn")
@@ -1715,6 +1899,22 @@ class MainWindow(FluentWindow):
             bu.schedule_delete(files, hours, log=self._log_from_thread)
         except Exception as e:
             self._log_from_thread(f"[!] 安排延迟删除失败：{type(e).__name__}: {e}")
+
+    def pick_anchor_cover(self, row: RoomRow) -> None:
+        page = self.anchor_pages.get(id(row))
+        f, _ = QFileDialog.getOpenFileName(
+            self, f"给 {row.room.text().strip() or '这个主播'} 选封面",
+            (row.cover or "") if row.cover else "",
+            "图片 (*.jpg *.jpeg *.png *.webp)")
+        if f and page is not None:
+            page.set_cover(f)
+            self.append_log(f"[i] [{row.room.text().strip()}] 封面：{f}")
+
+    def clear_anchor_cover(self, row: RoomRow) -> None:
+        page = self.anchor_pages.get(id(row))
+        if page is not None:
+            page.set_cover("")
+            self.append_log(f"[i] [{row.room.text().strip()}] 封面改回全局设置")
 
     def pick_cover(self) -> None:
         f, _ = QFileDialog.getOpenFileName(
