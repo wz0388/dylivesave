@@ -125,6 +125,11 @@ delete_after_upload = false
 delete_delay_hours = 0
 
 cover_position = 0             # 封面取第几秒的画面；0 = 视频第一帧
+
+# 自定义封面图（jpg/png）。留空 = 按 cover_position 从视频里抽一帧。
+# 路径用单引号写（Windows 反斜杠就不用转义了），例如 cover_file = 'D:/pics/封面.jpg'
+cover_file = ''
+
 container = 'ts'               # ts = 直接传（B 站云端转码，推荐）；mp4 = 先无损转封装再传
 keep_mp4 = true                # container=mp4 时，转出来的 mp4 是否保留（原 ts 始终保留）
 min_size_mb = 1                # 小于这个体积的片段不投稿，防止把空文件传上去
@@ -173,6 +178,8 @@ class BiliConfig:
     original: bool = True
     no_reprint: bool = True
     cover_position: float = 0.0
+    #: 自定义封面图（存在才用，否则从视频抽帧）
+    cover_file: str = ""
     container: str = "ts"
     keep_mp4: bool = True
     min_size_mb: float = 1.0
@@ -185,8 +192,9 @@ class BiliConfig:
     base_dir: Path = APP_DIR
 
 
-def write_config_template(path: Path = DEFAULT_CONFIG, force: bool = False) -> bool:
+def write_config_template(path: Path | None = None, force: bool = False) -> bool:
     """生成配置模板。已存在且非 force 时不动它，返回是否真的写了。"""
+    path = Path(path or DEFAULT_CONFIG)
     if path.exists() and not force:
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -238,9 +246,13 @@ def set_config_value(key: str, literal: str,
     return path
 
 
-def load_config(path: Path | str = DEFAULT_CONFIG) -> tuple[BiliConfig, bool]:
-    """读配置；文件不存在就先写一份模板。返回 (配置, 是否新建了模板)。"""
-    path = Path(path)
+def load_config(path: Path | str | None = None) -> tuple[BiliConfig, bool]:
+    """读配置；文件不存在就先写一份模板。返回 (配置, 是否新建了模板)。
+
+    默认路径在**调用时**才取 DEFAULT_CONFIG —— 写成参数默认值的话，
+    测试里改了 DEFAULT_CONFIG 也读不到（Python 默认参数只求值一次）。
+    """
+    path = Path(path or DEFAULT_CONFIG)
     created = write_config_template(path)
 
     raw: dict = {}
@@ -268,6 +280,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG) -> tuple[BiliConfig, bool]:
         original=_as_bool(b.get("original"), True),
         no_reprint=_as_bool(b.get("no_reprint"), True),
         cover_position=float(b.get("cover_position") or 0),
+        cover_file=str(b.get("cover_file") or ""),
         container=str(b.get("container") or "ts").lower(),
         keep_mp4=_as_bool(b.get("keep_mp4"), True),
         min_size_mb=float(b.get("min_size_mb") or 1),
@@ -1179,6 +1192,15 @@ class _StallGuard:
             pass
 
 
+def custom_cover(cfg: BiliConfig) -> Path | None:
+    """配置里指定的封面图；没配或文件不在就返回 None（退回抽帧）。"""
+    raw = str(getattr(cfg, "cover_file", "") or "").strip()
+    if not raw:
+        return None
+    p = Path(raw).expanduser()
+    return p if p.is_file() else None
+
+
 def _progress(log: Callable, progress_cb: Callable | None = None,
               guard: "_StallGuard | None" = None):
     """把库的分块事件换算成**整体进度百分比**。
@@ -1645,18 +1667,28 @@ def upload_recording(
         delete_uploaded(usable + made_mp4, cfg, log)     # 上传成功才删
         return {"bvid": target, "appended": True, "pages": pages}
 
-    # ---- ⑤ 封面：第一帧（建新稿必须给封面；追加分P不动封面）
-    cover_path = Path(tempfile.gettempdir()) / "bili_cover_douyin.jpg"
+    # ---- ⑤ 封面：优先用配置里指定的图；没配才从视频抽帧
+    #       （建新稿必须给封面；追加分P 不动封面）
+    from bilibili_api.utils.picture import Picture
     cover = None
-    log(f"[i] 抽取封面（第 {cfg.cover_position} 秒{'，即第一帧' if not cfg.cover_position else ''}）"
-        f"← {to_upload[0].name}")
-    if grab_frame(to_upload[0], cover_path, cfg.cover_position, ffmpeg):
-        from bilibili_api.utils.picture import Picture
-        cover = Picture().from_file(str(cover_path))
-        log(f"[i] 封面已生成：{cover.width}x{cover.height}")
-    else:
-        raise BiliError("抽第一帧失败，拿不到封面（B 站投稿必须给封面）。"
-                        "确认 ffmpeg 可用，或装 opencv-python 作为备选。")
+    mine = custom_cover(cfg)
+    if mine is not None:
+        try:
+            cover = Picture().from_file(str(mine))
+            log(f"[i] 使用自定义封面：{mine}（{cover.width}x{cover.height}）")
+        except Exception as e:
+            log(f"[!] 自定义封面读不了，改用抽帧：{e}")
+            cover = None
+    if cover is None:
+        cover_path = Path(tempfile.gettempdir()) / "bili_cover_douyin.jpg"
+        log(f"[i] 抽取封面（第 {cfg.cover_position} 秒"
+            f"{'，即第一帧' if not cfg.cover_position else ''}）← {to_upload[0].name}")
+        if grab_frame(to_upload[0], cover_path, cfg.cover_position, ffmpeg):
+            cover = Picture().from_file(str(cover_path))
+            log(f"[i] 封面已生成：{cover.width}x{cover.height}")
+        else:
+            raise BiliError("抽第一帧失败，拿不到封面（B 站投稿必须给封面）。"
+                            "确认 ffmpeg 可用，或装 opencv-python 作为备选。")
 
     # ---- ⑥ 组标题/简介（时间用**这一场直播的开始时间**，不是投稿时间）
     title = format_template(cfg.title_template, anchor=anchor, title=live_title,

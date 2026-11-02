@@ -364,6 +364,19 @@ python record.py --bili-login
 > 日志里会写清原因（`追加分P失败 …`），这一段会自动进待补传清单，
 > 过一会儿点「补传」就行。文件都还在本地，不会白传。
 
+### 封面可以自己指定
+
+默认封面是**视频第一帧**（`bili.toml` 里 `cover_position` 可以改成第 N 秒）。
+想用自己的图：界面「B 站投稿」那一行的 **封面**：
+
+- 点「选择图片」挑一张 jpg/png（建议 16:10、小于 2MB），路径会写进 `bili.toml` 的 `cover_file`；
+- 点「用第一帧」清空，回到自动抽帧；
+- 配了但文件后来被删/路径写错 → 自动退回抽帧，不会因为封面配错导致投稿失败。
+
+```toml
+cover_file = 'D:/pics/封面.jpg'   # 留空 = 从视频抽帧
+```
+
 ### 上传卡住了会自动重传
 
 B 站上传偶尔会「卡在那儿不动」：连接没断、但分块不再增加，能一直挂到天荒地老。
@@ -516,7 +529,7 @@ B 站要求封面必填且不接受空字符串，所以这帧是必须抽的；
 | `qqbot.json` | QQ 机器人的 AppID/AppSecret 与目标 openid（**含密钥，不进仓库**） |
 | `bili_delete_queue.json` | 延迟删除队列（到点清理本地录播，**不进仓库**） |
 | `bili_sessions.json` | 场次 → 稿件（bvid）对照表：同一场直播的分片靠它追加成同一个视频的分P（**不进仓库**） |
-| `tests/` | 分P 归属 / 删除开关 / 进度日志 / 每行分段时间 / 断流看门狗 / 合集的离线自测（不联网、不真传）：`tests/test_multipart.py`、`test_uploader_queue.py`、`test_delete_after_upload.py`、`test_live_log.py`、`test_row_segment.py`、`test_stall_watchdog.py`、`test_season.py`、`test_stream_errors.py`、`test_qqbot.py`、`test_delete_delay.py`、`test_upload_stall.py` |
+| `tests/` | 分P 归属 / 删除开关 / 进度日志 / 每行分段时间 / 断流看门狗 / 合集的离线自测（不联网、不真传）：`tests/test_multipart.py`、`test_uploader_queue.py`、`test_delete_after_upload.py`、`test_live_log.py`、`test_row_segment.py`、`test_stall_watchdog.py`、`test_season.py`、`test_stream_errors.py`、`test_qqbot.py`、`test_delete_delay.py`、`test_upload_stall.py`、`test_cover.py` |
 
 ### 关于 cookie.txt
 

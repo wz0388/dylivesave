@@ -684,6 +684,25 @@ class MainWindow(FluentWindow):
         h2.addStretch(1)
         lay.addWidget(bottom)
 
+        cover_row = QWidget(card)
+        h4 = QHBoxLayout(cover_row)
+        h4.setContentsMargins(0, 0, 0, 0)
+        h4.setSpacing(10)
+        lbl_cover = BodyLabel("封面")
+        lbl_cover.setFixedWidth(40)
+        h4.addWidget(lbl_cover)
+        self.ed_cover = LineEdit()
+        self.ed_cover.setPlaceholderText("留空 = 自动取视频第一帧；也可以指定一张 jpg/png")
+        self.ed_cover.setClearButtonEnabled(True)
+        h4.addWidget(self.ed_cover, 1)
+        btn_pick_cover = PushButton("选择图片", card)
+        btn_pick_cover.clicked.connect(self.pick_cover)
+        h4.addWidget(btn_pick_cover)
+        btn_auto_cover = PushButton("用第一帧", card)
+        btn_auto_cover.clicked.connect(self.clear_cover)
+        h4.addWidget(btn_auto_cover)
+        lay.addWidget(cover_row)
+
     def _build_action_bar(self, parent_lay) -> None:
         bar = QWidget(self)
         h = QHBoxLayout(bar)
@@ -1642,6 +1661,7 @@ class MainWindow(FluentWindow):
             self.ck_delete.setChecked(bool(cfg.delete_after_upload))
             self.ck_delete.blockSignals(False)
             self.ed_delay.setText(f"{float(cfg.delete_delay_hours or 0):g}")
+            self.ed_cover.setText(str(getattr(cfg, "cover_file", "") or ""))
         except Exception:
             pass
 
@@ -1695,6 +1715,31 @@ class MainWindow(FluentWindow):
             bu.schedule_delete(files, hours, log=self._log_from_thread)
         except Exception as e:
             self._log_from_thread(f"[!] 安排延迟删除失败：{type(e).__name__}: {e}")
+
+    def pick_cover(self) -> None:
+        f, _ = QFileDialog.getOpenFileName(
+            self, "选择封面图片（建议 16:10，jpg/png）",
+            self.ed_cover.text() or "", "图片 (*.jpg *.jpeg *.png *.webp)")
+        if not f:
+            return
+        self._save_cover(f)
+
+    def clear_cover(self) -> None:
+        self.ed_cover.setText("")
+        self._save_cover("")
+
+    def _save_cover(self, path: str) -> None:
+        """封面路径写回 bili.toml（单引号 = 字面量，Windows 路径不用转义）。"""
+        path = (path or "").strip()
+        try:
+            bu.set_config_value("cover_file", f"'{path}'")
+        except Exception as e:
+            InfoBar.error("写配置失败", f"bili.toml 没写进去：{e}", duration=5000,
+                          position=InfoBarPosition.TOP, parent=self)
+            self._load_delete_setting()
+            return
+        self.ed_cover.setText(path)
+        self.append_log("[i] 封面：" + (path if path else "自动取视频第一帧"))
 
     def _sweep_deletes(self) -> None:
         """把到点的延迟删除清掉（启动时一次，之后每 10 分钟一次）。"""
