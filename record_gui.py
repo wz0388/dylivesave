@@ -1306,22 +1306,41 @@ class MainWindow(FluentWindow):
             return "现在的主播：\n" + "\n".join(lines)
 
         if cmd == "状态":
+            if not self.rows:
+                return "还没添加主播"
             rec_n = 0
             lines = []
             for i, r in enumerate(self.rows, 1):
                 room = r.room.text().strip()
-                if r.running:
-                    name = r.anchor or room or str(r.rid or "?")
-                    rid = r.rid or room or "?"
-                    if r.mode == "recording":
-                        rec_n += 1
-                        st = "录制中"
-                    else:
-                        st = "监控中（等开播）"
-                    lines.append(f"#{i} {name}（{rid}）· {st}")
+                rid = r.rid or room or "?"
+                if not r.running:
+                    label = room or "（空）"
+                    label = label if label == str(rid) else f"{label}（{rid}）"
+                    lines.append(f"#{i} {label} · 未在录")
+                    continue
+                name = str(r.anchor or room or rid)
+                label = name if name == str(rid) else f"{name}（{rid}）"
+                if r.mode == "recording":
+                    rec_n += 1
+                    st = "录制中"
                 else:
-                    lines.append(f"#{i} {room or '（空）'}（{r.rid or room or '?'}）· 未在录")
-            up = f"；后台上传 {self._up_pct}%" if self._up_chunks else ""
+                    st = "监控中（等开播）"
+                # 具体进度：「已写 3.20 GB · 已录 01:23:45」（没有就不显示）
+                prog = getattr(r, "_progress", "") or ""
+                parts = [st] + ([prog] if prog else [])
+                # 这个主播最近一段的投稿状态（有就带上）
+                page = self.anchor_pages.get(id(r))
+                if page is not None and page.up_rows:
+                    last = list(page.up_rows.values())[-1]
+                    ustate = last.state.text()
+                    if "上传中" in ustate:
+                        parts.append(f"投稿 {last.pct.text()}")
+                    elif "已投稿" in ustate:
+                        parts.append("已投稿")
+                    elif "失败" in ustate:
+                        parts.append("投稿失败")
+                lines.append(f"#{i} {label} · " + " · ".join(parts))
+            up = f"；后台上传 {self._up_pct}%（{self._up_chunks} 块）" if self._up_chunks else ""
             head = f"{len(self.rows)} 个主播，{rec_n} 路录制中{up}"
             return head + "\n" + "\n".join(lines)
 

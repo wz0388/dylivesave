@@ -268,6 +268,20 @@ def test_gui() -> None:
         assert w._on_unbind_ui("group", "GROUP_OPENID_1") == "已解绑，不再往这里发通知"
         assert "GROUP_OPENID_1" not in w.ed_groups.text()
 
+        # #状态 要能看到这一路的具体进度（已写/已录），不只一个「录制中」
+        row0 = w.rows[0]
+        row0.room.setText("50141210842")
+        row0.rid = row0.tag = "50141210842"
+        row0.anchor = "李大霄"
+        row0.running = True
+        row0.mode = "recording"
+        row0.set_progress("已写 3.20 GB · 已录 01:23:45")
+        txt = w._bot_command_ui("状态", "", "u1")
+        assert "录制中" in txt and "已写 3.20 GB" in txt, txt
+        assert "01:23:45" in txt and "李大霄" in txt, txt
+        row0.running = False
+        row0.set_progress("")
+
         # 通知要带时间戳（年月日 时分秒）
         class _FakeBot:
             def __init__(self):
