@@ -367,6 +367,19 @@ python record.py --bili-login
 > 日志里会写清原因（`追加分P失败 …`），这一段会自动进待补传清单，
 > 过一会儿点「补传」就行。文件都还在本地，不会白传。
 
+### 每个主播独立的目录和投稿配置
+
+点进主播自己的分页，有「**独立配置（留空 = 跟随公共设置）**」两行：
+
+| 项 | 留空时 | 填了之后 |
+|---|---|---|
+| **录制目录** | 用「公共设置」里的输出目录 | 这个主播的录像单独存到别处（比如另一个盘） |
+| **B 站配置** | 用全局 `bili.toml` | 用**另一份 bili.toml**：分区、标题模板、标签、合集、封面、甚至另一个账号（它有自己的 `credential_file`） |
+
+- 「选择/新建」会**按当前全局配置复制一份**给你改，不用从模板一条条填；
+- 配置路径写错 / 文件被删 → 这一段会明确报「配置不存在」，**不会**悄悄退回全局参数投出去；
+- 存在 `record_gui.json` 的 `rooms[].out_dir` / `rooms[].bili_config`，跟着主播走。
+
 ### 封面可以自己指定（全局 + 每个主播）
 
 **全局**：默认封面是**视频第一帧**（`bili.toml` 里 `cover_position` 可以改成第 N 秒）。
@@ -535,7 +548,7 @@ B 站要求封面必填且不接受空字符串，所以这帧是必须抽的；
 | `qqbot.json` | QQ 机器人的 AppID/AppSecret 与目标 openid（**含密钥，不进仓库**） |
 | `bili_delete_queue.json` | 延迟删除队列（到点清理本地录播，**不进仓库**） |
 | `bili_sessions.json` | 场次 → 稿件（bvid）对照表：同一场直播的分片靠它追加成同一个视频的分P（**不进仓库**） |
-| `tests/` | 分P 归属 / 删除开关 / 进度日志 / 每行分段时间 / 断流看门狗 / 合集的离线自测（不联网、不真传）：`tests/test_multipart.py`、`test_uploader_queue.py`、`test_delete_after_upload.py`、`test_live_log.py`、`test_row_segment.py`、`test_stall_watchdog.py`、`test_season.py`、`test_stream_errors.py`、`test_qqbot.py`、`test_delete_delay.py`、`test_upload_stall.py`、`test_cover.py` |
+| `tests/` | 分P 归属 / 删除开关 / 进度日志 / 每行分段时间 / 断流看门狗 / 合集的离线自测（不联网、不真传）：`tests/test_multipart.py`、`test_uploader_queue.py`、`test_delete_after_upload.py`、`test_live_log.py`、`test_row_segment.py`、`test_stall_watchdog.py`、`test_season.py`、`test_stream_errors.py`、`test_qqbot.py`、`test_delete_delay.py`、`test_upload_stall.py`、`test_cover.py`、`test_anchor_config.py` |
 
 ### 关于 cookie.txt
 

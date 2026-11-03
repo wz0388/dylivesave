@@ -416,6 +416,7 @@ class UploadWorker:
         self._enabled = False
         self._cred_problem = ""            # 登录态失效的原因（非空=这些段要等登录后补传）
         self._throttle = None               # bu.SubmitThrottle，第一次用到才建
+        self._cfg_cache: dict[str, tuple] = {}   # 主播独立配置：路径 -> (cfg, 问题)
 
     def log(self, *a):
         try:
@@ -469,7 +470,7 @@ class UploadWorker:
         self._thread.start()
 
     def submit(self, seg: dict, *, rid, anchor, live_title, quality, ffmpeg,
-               session=None, part=1, season=None, cover="") -> None:
+               session=None, part=1, season=None, cover="", config="") -> None:
         """把一个录完的分段交给后台上传（立刻返回，不阻塞录制）。
 
         session: 这一场直播的状态（LiveSession.state）。传了且 bili.toml 里
@@ -477,6 +478,7 @@ class UploadWorker:
         part:    这一段从第几个分P 起算（1 起）。
         season:  建稿成功后要加入的合集（这个主播选的），追加分P 时不再重复加。
         cover:   这个主播自己的封面图（空 = 用配置里的，再空就抽帧）。
+        config:  这个主播自己的 bili.toml（空 = 用全局配置）。
         """
         files = list(seg.get("files") or [])
         if not files:
@@ -490,7 +492,8 @@ class UploadWorker:
                         quality=quality, ffmpeg=ffmpeg,
                         session=session,
                         session_key=str((session or {}).get("key") or ""),
-                        part=int(part or 0), season=season, cover=cover))
+                        part=int(part or 0), season=season, cover=cover,
+                        config=str(config or "")))
         self.start()
         extra = ""
         if session:
@@ -551,6 +554,42 @@ class UploadWorker:
             return f"#{seq} P{part}"
         return f"#{seq}"
 
+    def _cfg_for(self, item) -> tuple:
+        """这一段的投稿配置：主播自己配了 bili.toml 就用它，否则用全局的。
+
+        返回 (cfg, 问题描述)；cfg 为 None 表示这次不该/不能投。
+        """
+        path = str(item.get("config") or "").strip()
+        if not path:
+            ok = self._ensure_cfg()
+            return (self._cfg, "") if ok else (None, self._cred_problem)
+
+        import bili_uploader as bu
+        if path in self._cfg_cache:
+            return self._cfg_cache[path]
+        # 先看文件在不在：load_config 遇到不存在的路径会**新建模板**，
+        # 路径打错一个字就会静悄悄按默认参数投稿，太坑了
+        if not Path(path).is_file():
+            return (None, f"主播配置不存在：{path}")
+        try:
+            cfg, _ = bu.load_config(path)
+        except Exception as e:
+            return (None, f"读不了主播配置 {path}：{e}")
+        if self.no_bili:
+            return (None, "命令行指定了 --no-bili")
+        if not cfg.enabled:
+            return (None, f"{path} 里 enabled = false")
+        try:                                  # 登录态按**这个配置**的凭据文件查
+            cred = bu.read_credential(cfg.cred_file) or {}
+            status, detail = bu.check_cookie_status(cred)
+        except Exception as e:
+            status, detail = "unknown", f"{type(e).__name__}: {e}"
+        if status == "invalid":
+            return (None, f"B 站登录态不可用（{path}）：{detail}")
+        result = (cfg, "")
+        self._cfg_cache[path] = result
+        return result
+
     def _run_one(self, item) -> None:
         label = self._label(item)
         # 日志带上主播名：界面按 [名字] 把这条分到该主播自己的分页里
@@ -558,14 +597,15 @@ class UploadWorker:
 
         def log(*a):
             self.log(f"[{who}]", *a)
-        if not self._ensure_cfg():
+        item_cfg, cfg_problem = self._cfg_for(item)
+        if item_cfg is None:
             import bili_uploader as bu
-            if self._cred_problem:
+            if cfg_problem:
                 # 登录态失效：不是「不必传」，而是「传不了」—— 记成待补传，别丢了
                 self.failed.append(item)
-                bu.remember_failed(item, self._cred_problem)
+                bu.remember_failed(item, cfg_problem)
                 self._notify(item["seq"], "fail", 0, item.get("anchor") or "", label=label)
-                log(f"[!] 第 {item['seq']} 段没传：{self._cred_problem}")
+                log(f"[!] 第 {item['seq']} 段没传：{cfg_problem}")
                 log(f"    已记到 {bu.failed_path().name}，重新登录后点「补传」即可")
             else:
                 log(f"[i] 第 {item['seq']} 段不投稿（原因见上面）")
@@ -585,7 +625,7 @@ class UploadWorker:
         log(f"[i] 后台开始上传第 {item['seq']} 段：{len(item['files'])} 个文件{hint}")
         try:
             info = bu.upload_recording(
-                item["files"], anchor=item["anchor"], cfg=self._cfg,
+                item["files"], anchor=item["anchor"], cfg=item_cfg,
                 room_id=item["rid"], live_title=item["live_title"],
                 quality=item["quality"], ffmpeg=item["ffmpeg"],
                 when=item["start"], seg_index=item["seq"], seg_total=0,
@@ -1026,7 +1066,7 @@ def run_recording(rid, *, quality="FULL_HD1", protocol="flv", duration=0, segmen
                             live_title=streams.title, quality=quality,
                             ffmpeg=ffmpeg, session=session.state,
                             part=session.take_parts(n), season=season,
-                            cover=cover)
+                            cover=cover, config=bili_config)
         else:
             end_upload.append(seg)
 

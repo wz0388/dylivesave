@@ -164,6 +164,8 @@ class RoomRow(QFrame):
         self.anchor = ""
         self.mode = "idle"
         self.cover = ""           # 这个主播专属的封面（空 = 用全局/抽帧）
+        self.out_dir = ""         # 这个主播自己的录制目录（空 = 用公共设置）
+        self.bili_config = ""     # 这个主播自己的 bili.toml（空 = 用全局配置）
         self.stop_event: threading.Event | None = None
         self.thread: threading.Thread | None = None
         self.season: dict | None = None
@@ -246,6 +248,8 @@ class RoomRow(QFrame):
             "segment": self.segment.currentText(),
             "season": self.season,
             "cover": self.cover,
+            "out_dir": self.out_dir,
+            "bili_config": self.bili_config,
         }
 
     def set_state(self, text: str, kind: str = "muted") -> None:
@@ -325,6 +329,49 @@ class AnchorPage(QWidget):
         ha.addStretch(1)
         lay.addWidget(act)
 
+        # ---- 独立配置（留空 = 跟公共设置走）
+        lay.addWidget(StrongBodyLabel("独立配置（留空 = 跟随公共设置）"))
+
+        dir_row = QWidget(holder)
+        hd = QHBoxLayout(dir_row)
+        hd.setContentsMargins(0, 0, 0, 0)
+        hd.setSpacing(10)
+        lbd = BodyLabel("录制目录")
+        lbd.setFixedWidth(64)
+        hd.addWidget(lbd)
+        self.ed_dir = LineEdit()
+        self.ed_dir.setPlaceholderText("留空 = 用公共设置里的输出目录")
+        self.ed_dir.setClearButtonEnabled(True)
+        self.ed_dir.editingFinished.connect(self._dir_changed)
+        hd.addWidget(self.ed_dir, 1)
+        d1 = PushButton("浏览", dir_row)
+        d1.clicked.connect(lambda: app.pick_anchor_dir(row))
+        hd.addWidget(d1)
+        d2 = PushButton("用公共", dir_row)
+        d2.clicked.connect(lambda: app.clear_anchor_dir(row))
+        hd.addWidget(d2)
+        lay.addWidget(dir_row)
+
+        cfg_row = QWidget(holder)
+        hcfg = QHBoxLayout(cfg_row)
+        hcfg.setContentsMargins(0, 0, 0, 0)
+        hcfg.setSpacing(10)
+        lbc = BodyLabel("B 站配置")
+        lbc.setFixedWidth(64)
+        hcfg.addWidget(lbc)
+        self.ed_cfg = LineEdit()
+        self.ed_cfg.setPlaceholderText("留空 = 全局 bili.toml；可指定另一个账号/分区/标题模板")
+        self.ed_cfg.setClearButtonEnabled(True)
+        self.ed_cfg.editingFinished.connect(self._cfg_changed)
+        hcfg.addWidget(self.ed_cfg, 1)
+        c1 = PushButton("选择/新建", cfg_row)
+        c1.clicked.connect(lambda: app.pick_anchor_config(row))
+        hcfg.addWidget(c1)
+        c2 = PushButton("用公共", cfg_row)
+        c2.clicked.connect(lambda: app.clear_anchor_config(row))
+        hcfg.addWidget(c2)
+        lay.addWidget(cfg_row)
+
         # ---- 这个主播专属的封面（留空就用全局的）
         cover_row = QWidget(holder)
         hc = QHBoxLayout(cover_row)
@@ -383,6 +430,14 @@ class AnchorPage(QWidget):
             pass
 
     # ---- 封面
+    def _dir_changed(self) -> None:
+        self.row.out_dir = self.ed_dir.text().strip()
+        self.app._save_settings()
+
+    def _cfg_changed(self) -> None:
+        self.row.bili_config = self.ed_cfg.text().strip()
+        self.app._save_settings()
+
     def _cover_changed(self) -> None:
         self.row.cover = self.ed_cover.text().strip()
         self.app._save_settings()
@@ -1418,7 +1473,8 @@ class MainWindow(FluentWindow):
 
     # ─────────────────── 主播行 ───────────────────
     def add_row(self, room: str = "", quality: str = "", segment: str = "",
-                season=None, cover: str = "") -> RoomRow:
+                season=None, cover: str = "", out_dir: str = "",
+                bili_config: str = "") -> RoomRow:
         row = RoomRow(self, len(self.rows) + 1)
         row.room.setText(room or "")
         row.quality.setCurrentText(_quality_label(quality))
@@ -1426,6 +1482,8 @@ class MainWindow(FluentWindow):
                                    else self.cmb_segment.currentText())
         row.set_season(season)
         row.cover = (cover or "").strip()
+        row.out_dir = (out_dir or "").strip()
+        row.bili_config = (bili_config or "").strip()
         self.rows_lay.addWidget(row)
         self.rows.append(row)
 
@@ -1433,6 +1491,8 @@ class MainWindow(FluentWindow):
         page = AnchorPage(self, row)
         page.setObjectName(f"anchorPage{id(row)}")
         page.ed_cover.setText(row.cover)
+        page.ed_dir.setText(row.out_dir)
+        page.ed_cfg.setText(row.bili_config)
         page.refresh_title()
         self.anchor_pages[id(row)] = page
         title = f"#{row.idx} " + (room[:8] if room else "新主播")
@@ -1527,7 +1587,8 @@ class MainWindow(FluentWindow):
         for r in rooms or [{}]:
             self.add_row(r.get("room", ""), r.get("quality", ""),
                          r.get("segment", ""), r.get("season"),
-                         r.get("cover", ""))
+                         r.get("cover", ""), r.get("out_dir", ""),
+                         r.get("bili_config", ""))
         if not self.rows:
             self.add_row()
         self._load_delete_setting()
@@ -1765,7 +1826,7 @@ class MainWindow(FluentWindow):
                              position=InfoBarPosition.TOP, parent=self)
                 return False
 
-        out_dir = Path(self.ed_dir.text()).expanduser()
+        out_dir = Path(row.out_dir or self.ed_dir.text()).expanduser()
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
         except Exception as e:
@@ -1792,7 +1853,7 @@ class MainWindow(FluentWindow):
                 out_dir=str(out_dir), wait=self._wait_seconds(), upload=True,
                 monitor=self.sw_monitor.isChecked(),
                 on_segment_done=self._on_segment_done,
-                cover=row.cover or ""))
+                cover=row.cover or "", bili_config=row.bili_config or ""))
         row.thread.start()
         self.append_log(f"===== 开录 [{tag}] {rid} =====")
         row.set_state("● 等待开播", "warn")
@@ -1922,6 +1983,62 @@ class MainWindow(FluentWindow):
             bu.schedule_delete(files, hours, log=self._log_from_thread)
         except Exception as e:
             self._log_from_thread(f"[!] 安排延迟删除失败：{type(e).__name__}: {e}")
+
+    def pick_anchor_dir(self, row: RoomRow) -> None:
+        page = self.anchor_pages.get(id(row))
+        d = QFileDialog.getExistingDirectory(
+            self, f"给 {row.room.text().strip() or '这个主播'} 选录制目录",
+            row.out_dir or self.ed_dir.text() or str(rec.DEFAULT_DIR))
+        if d and page is not None:
+            page.row.out_dir = d
+            page.ed_dir.setText(d)
+            self._save_settings()
+            self.append_log(f"[i] [{row.room.text().strip()}] 录制目录：{d}")
+
+    def clear_anchor_dir(self, row: RoomRow) -> None:
+        page = self.anchor_pages.get(id(row))
+        if page is not None:
+            page.row.out_dir = ""
+            page.ed_dir.setText("")
+            self._save_settings()
+            self.append_log(f"[i] [{row.room.text().strip()}] 录制目录改回公共设置")
+
+    def pick_anchor_config(self, row: RoomRow) -> None:
+        """给这个主播单独指定一份 bili.toml（可以完全是另一个账号/分区）。"""
+        page = self.anchor_pages.get(id(row))
+        start = row.bili_config or str(APP_DIR / "bili_anchor.toml")
+        f, _ = QFileDialog.getSaveFileName(
+            self, f"给 {row.room.text().strip() or '这个主播'} 选 bili.toml",
+            start, "配置文件 (*.toml)")
+        if not f:
+            return
+        p = Path(f)
+        if not p.exists():
+            # 新文件：先按当前全局配置复制一份，省得从模板一条条改
+            try:
+                src = bu.DEFAULT_CONFIG
+                if src.is_file():
+                    p.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+                    self.append_log(f"[i] 已按全局配置创建：{p}")
+                else:
+                    bu.write_config_template(p)
+            except Exception as e:
+                InfoBar.error("建配置失败", str(e), duration=5000,
+                              position=InfoBarPosition.TOP, parent=self)
+                return
+        if page is not None:
+            page.row.bili_config = str(p)
+            page.ed_cfg.setText(str(p))
+            self._save_settings()
+            self.append_log(f"[i] [{row.room.text().strip()}] 独立投稿配置：{p}")
+
+    def clear_anchor_config(self, row: RoomRow) -> None:
+        page = self.anchor_pages.get(id(row))
+        if page is not None:
+            page.row.bili_config = ""
+            page.ed_cfg.setText("")
+            self._save_settings()
+            self.append_log(f"[i] [{row.room.text().strip()}] 投稿配置改回全局")
 
     def pick_anchor_cover(self, row: RoomRow) -> None:
         page = self.anchor_pages.get(id(row))
