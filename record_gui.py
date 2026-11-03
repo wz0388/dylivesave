@@ -269,6 +269,10 @@ class RoomRow(QFrame):
         self.segment.setEnabled(not running)
         self.btn_start.setEnabled(not running)
         self.btn_stop.setEnabled(running)
+        page = getattr(self.app, "anchor_pages", {}).get(id(self))
+        if page is not None:               # 主播页上的按钮跟着一起变
+            page.btn_start.setEnabled(not running)
+            page.btn_stop.setEnabled(running)
 
 
 
@@ -306,6 +310,21 @@ class AnchorPage(QWidget):
         h.addWidget(self.progress, 1)
         lay.addWidget(head)
 
+        # ---- 开始 / 停止（不用回总监控页点）
+        act = QWidget(holder)
+        ha = QHBoxLayout(act)
+        ha.setContentsMargins(0, 0, 0, 0)
+        ha.setSpacing(10)
+        self.btn_start = PrimaryPushButton(FIF.PLAY, "开始录制", act)
+        self.btn_start.clicked.connect(lambda: app.start_row(row))
+        ha.addWidget(self.btn_start)
+        self.btn_stop = PushButton(FIF.PAUSE, "停止", act)
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(lambda: app.stop_row(row))
+        ha.addWidget(self.btn_stop)
+        ha.addStretch(1)
+        lay.addWidget(act)
+
         # ---- 这个主播专属的封面（留空就用全局的）
         cover_row = QWidget(holder)
         hc = QHBoxLayout(cover_row)
@@ -333,6 +352,8 @@ class AnchorPage(QWidget):
         self.up_lay = QVBoxLayout(self.up_box)
         self.up_lay.setContentsMargins(0, 0, 0, 0)
         self.up_lay.setSpacing(6)
+        self.up_hint = CaptionLabel("还没有上传记录")
+        self.up_lay.addWidget(self.up_hint)
         lay.addWidget(self.up_box)
 
         # ---- 这个主播的日志
@@ -340,6 +361,7 @@ class AnchorPage(QWidget):
         self.log_edit = TextEdit()
         self.log_edit.setReadOnly(True)
         self.log_edit.setFont(QFont("Consolas", 9))
+        self.log_edit.setPlaceholderText("这个主播的日志会出现在这里")
         self.log_edit.setMinimumHeight(320)
         lay.addWidget(self.log_edit, 1)
 
@@ -418,6 +440,7 @@ class AnchorPage(QWidget):
             w = UploadRow(self.up_box)
             self.up_lay.addWidget(w)
             self.up_rows[iid] = w
+            self.up_hint.hide()
         w.update_row(seg, anchor, state, pct)
 
 
