@@ -133,6 +133,45 @@ def file_log(text: str) -> None:
         pass
 
 
+def _write_log_line(edit, line: str, fmt, live: str, live_map: dict,
+                    follow: bool) -> None:
+    """往日志框写一行，并按「是否跟随最新」决定滚动。
+
+    ⚠️ 就地替换「已写」那行时**绝不能动滚动位置** —— 之前统一 setTextCursor +
+    ensureCursorVisible，光标停在那行（往往在文档前部），视图就被拽回顶部了。
+    """
+    sb = edit.verticalScrollBar()
+    keep = sb.value()
+    replaced = False
+    try:
+        blk = live_map.get(live) if live else None
+        if blk is not None and blk.isValid():
+            cur = QTextCursor(blk)
+            cur.setPosition(blk.position())
+            cur.setPosition(blk.position() + max(0, blk.length() - 1),
+                            QTextCursor.MoveMode.KeepAnchor)
+            cur.insertText(line, fmt)
+            live_map[live] = cur.block()
+            replaced = True
+        else:
+            cur = QTextCursor(edit.document())
+            cur.movePosition(QTextCursor.MoveOperation.End)
+            if edit.toPlainText():
+                cur.insertBlock()
+            cur.insertText(line, fmt)
+            if live:
+                live_map[live] = cur.block()
+    except Exception:
+        return
+    try:
+        if replaced or not follow:
+            sb.setValue(min(keep, sb.maximum()))     # 保持用户当前看到的位置
+        else:
+            edit.moveCursor(QTextCursor.MoveOperation.End)   # 跟随最新
+    except Exception:
+        pass
+
+
 class Bridge(QObject):
     """录制线程 → 界面线程的信号桥。
 
@@ -404,7 +443,17 @@ class AnchorPage(QWidget):
         lay.addWidget(self.up_box)
 
         # ---- 这个主播的日志
-        lay.addWidget(StrongBodyLabel("日志"))
+        hlog = QHBoxLayout()
+        hlog.addWidget(StrongBodyLabel("日志"))
+        hlog.addStretch(1)
+        hlog.addWidget(CaptionLabel("跟随最新"))
+        self.sw_follow = SwitchButton()
+        self.sw_follow.setOnText("开")
+        self.sw_follow.setOffText("关")
+        self.sw_follow.setChecked(bool(getattr(app, "follow_log", True)))
+        self.sw_follow.checkedChanged.connect(lambda on: app.set_follow(on))
+        hlog.addWidget(self.sw_follow)
+        lay.addLayout(hlog)
         self.log_edit = TextEdit()
         self.log_edit.setReadOnly(True)
         self.log_edit.setFont(QFont("Consolas", 9))
@@ -466,27 +515,8 @@ class AnchorPage(QWidget):
         fmt = QTextCharFormat()
         if kind:
             fmt.setForeground(QColor(C(kind)))
-        try:
-            blk = self._live.get(live) if live else None
-            if blk is not None and blk.isValid():
-                cur = QTextCursor(blk)
-                cur.setPosition(blk.position())
-                cur.setPosition(blk.position() + max(0, blk.length() - 1),
-                                QTextCursor.MoveMode.KeepAnchor)
-                cur.insertText(line, fmt)
-                self._live[live] = cur.block()
-            else:
-                cur = QTextCursor(self.log_edit.document())
-                cur.movePosition(QTextCursor.MoveOperation.End)
-                if self.log_edit.toPlainText():
-                    cur.insertBlock()
-                cur.insertText(line, fmt)
-                if live:
-                    self._live[live] = cur.block()
-            self.log_edit.setTextCursor(cur)
-            self.log_edit.ensureCursorVisible()
-        except Exception:
-            pass
+        _write_log_line(self.log_edit, line, fmt, live, self._live,
+                        getattr(self.app, "follow_log", True))
 
     # ---- 上传进度卡片
     def up_row(self, iid: str, seg, anchor, state, pct) -> None:
@@ -650,6 +680,7 @@ class MainWindow(FluentWindow):
         self._pending_qr: dict | None = None
         self.bot: qb.QQBot | None = None            # QQ 机器人（没启用时是 None）
         self.bot_cfg = qb.load_config(APP_DIR)
+        self.follow_log = True          # 日志是否自动滚到最新（可在日志页关掉）
 
         self.settings = self._read_settings()
 
@@ -723,6 +754,20 @@ class MainWindow(FluentWindow):
         self.bot_lay.addStretch(1)
 
         self.log_page, self.log_lay = self._scroll_page("logPage", "总日志")
+        bar = QWidget(self.log_page)
+        hb = QHBoxLayout(bar)
+        hb.setContentsMargins(0, 0, 0, 0)
+        hb.setSpacing(8)
+        hb.addWidget(CaptionLabel("老的日志在上面，新的在下面；关掉就不会自动滚动了"))
+        hb.addStretch(1)
+        hb.addWidget(CaptionLabel("跟随最新"))
+        self.sw_follow = SwitchButton()
+        self.sw_follow.setOnText("开")
+        self.sw_follow.setOffText("关")
+        self.sw_follow.checkedChanged.connect(self.set_follow)
+        hb.addWidget(self.sw_follow)
+        self.log_lay.addWidget(bar)
+
         self.log_edit = TextEdit()
         self.log_edit.setReadOnly(True)
         self.log_edit.setFont(QFont("Consolas", 10))
@@ -1601,6 +1646,13 @@ class MainWindow(FluentWindow):
         self.ck_upload.setChecked(bool(d.get("upload", True)))
         self.sw_monitor.setChecked(bool(d.get("monitor", True)))
         self.sw_dark.setChecked(self.settings.get("theme") == "dark")
+        self.follow_log = bool(d.get("follow_log", True))
+        try:
+            self.sw_follow.blockSignals(True)
+            self.sw_follow.setChecked(self.follow_log)
+            self.sw_follow.blockSignals(False)
+        except Exception:
+            pass
         self.local_delete_hours = float(d.get("local_delete_hours") or 0)
         self.ed_local_delete.setText(f"{self.local_delete_hours:g}")
         for r in rooms or [{}]:
@@ -1630,6 +1682,7 @@ class MainWindow(FluentWindow):
                 "monitor": self.sw_monitor.isChecked(),
                 "theme": "dark" if isDarkTheme() else "light",
                 "local_delete_hours": float(getattr(self, "local_delete_hours", 0) or 0),
+                "follow_log": bool(getattr(self, "follow_log", True)),
             }, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
@@ -1705,29 +1758,7 @@ class MainWindow(FluentWindow):
         fmt = QTextCharFormat()
         if kind:
             fmt.setForeground(QColor(C(kind)))
-        blk = self._live_blocks.get(live) if live else None
-        try:
-            if blk is not None and blk.isValid():
-                # 只替换这一段的**文字**，别把段落符也删了 —— 用 BlockUnderCursor
-                # 会把整块连换行一起删掉，结果两行粘成一行
-                cur = QTextCursor(blk)
-                cur.setPosition(blk.position())
-                cur.setPosition(blk.position() + max(0, blk.length() - 1),
-                                QTextCursor.MoveMode.KeepAnchor)
-                cur.insertText(line, fmt)
-                self._live_blocks[live] = cur.block()
-            else:
-                cur = QTextCursor(edit.document())
-                cur.movePosition(QTextCursor.MoveOperation.End)
-                if edit.toPlainText():
-                    cur.insertBlock()          # ⚠️ 只接受 QTextBlockFormat，传 QTextCharFormat 会 TypeError
-                cur.insertText(line, fmt)
-                if live:
-                    self._live_blocks[live] = cur.block()
-            edit.setTextCursor(cur)
-            edit.ensureCursorVisible()
-        except Exception:
-            pass
+        _write_log_line(edit, line, fmt, live, self._live_blocks, self.follow_log)
 
     # ─────────────────── 上传进度（挂到各自的主播页） ───────────────────
     def _up_row(self, iid: str, seg, anchor, state, pct) -> None:
@@ -1973,6 +2004,22 @@ class MainWindow(FluentWindow):
             self.uploader.reload_cfg()
         self.append_log("[i] 上传成功后删除："
                         + ("立即删" if hours <= 0 else f"延后 {hours:g} 小时"))
+
+    def set_follow(self, on: bool) -> None:
+        """日志是否自动跟到最新。总日志页和每个主播页共用这一个状态。"""
+        self.follow_log = bool(on)
+        switches = [getattr(self, "sw_follow", None)]
+        switches += [pg.sw_follow for pg in getattr(self, "anchor_pages", {}).values()]
+        for sw in switches:
+            if sw is None:
+                continue
+            try:
+                sw.blockSignals(True)
+                sw.setChecked(self.follow_log)
+                sw.blockSignals(False)
+            except Exception:
+                pass
+        self._save_settings()
 
     def _save_local_delete(self) -> None:
         """「录完 x 小时删本地」——纯录制侧设置，和投稿无关。"""

@@ -74,10 +74,40 @@ def test_console_single_line() -> None:
     w.close()
 
 
+def test_scroll_not_jump() -> None:
+    """就地刷新「已写」那一行时，不能把视图拽走（以前会跳回顶部）。"""
+    g.file_log = lambda text: None
+    g.SETTINGS = Path(tempfile.mkdtemp()) / "record_gui.json"
+    w = g.MainWindow()
+    try:
+        w.resize(1120, 800)
+        w.show()
+        w.switchTo(w.log_page)
+        APP.processEvents()
+        for i in range(80):
+            w.append_log(f"[50141210842] 第 {i} 行", "")
+        w.append_log("[50141210842]   已写 3.0 GB，已录 00:10:00", "rec:1")
+        for _ in range(4):
+            APP.processEvents()
+        sb = w.log_edit.verticalScrollBar()
+        assert sb.maximum() > 20, ("窗口没显示出来，滚动条不可测", sb.maximum())
+        sb.setValue(10)
+        APP.processEvents()
+        # 同一个 key 再来一次 → 走「就地替换」分支
+        w.append_log("[50141210842]   已写 3.1 GB，已录 00:10:03", "rec:1")
+        for _ in range(3):
+            APP.processEvents()
+        assert sb.value() == 10, ("就地刷新把视图拽走了", sb.value())
+        assert "3.1 GB" in w.log_edit.toPlainText()
+    finally:
+        w.close()
+
+
 def main() -> int:
     test_emit_log_fallback()
     test_console_single_line()
-    print("OK：已写带时长、同一房间只留一条、别的房间不受影响、普通日志追加 全部通过")
+    test_scroll_not_jump()
+    print("OK：已写带时长、同一房间只留一条、别的房间不受影响、普通日志追加、就地刷新不滚动 全部通过")
     return 0
 
 
