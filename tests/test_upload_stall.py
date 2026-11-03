@@ -9,6 +9,7 @@
   · 卡住后旧的重传逻辑：每次都从头再来，最多 STALL_RETRIES 次，
     每次都给 QQ 发一条通知；全卡住才抛 BiliError（进待补传清单）。
 """
+import asyncio
 import sys
 import time
 from pathlib import Path
@@ -122,13 +123,46 @@ def test_retry_then_success() -> None:
     assert len(calls) == 2 and len(notes) == 1, (calls, notes)
 
 
+def test_returned_but_fired() -> None:
+    """库把取消吞掉、返回空 dict —— 只要看门狗响过，就得当卡住重传。"""
+    def coro_factory(guard):
+        async def run():
+            try:
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                return {}          # 故意「正常」返回空结果
+            return {}
+        return run()
+
+    try:
+        bu._run_upload_once(coro_factory, QUIET, timeout=0.3)
+        raise AssertionError("看门狗响了却没抛 UploadStalled")
+    except bu.UploadStalled:
+        pass
+
+
+def test_as_dt() -> None:
+    """补传时 start 是 isoformat 字符串，必须能转回 datetime。"""
+    from datetime import datetime as _dt
+    assert bu._as_dt("2026-11-03T20:32:05") == _dt(2026, 11, 3, 20, 32, 5)
+    d = _dt(2026, 11, 3, 1, 2, 3)
+    assert bu._as_dt(d) is d
+    assert bu._as_dt("") is None and bu._as_dt(None) is None
+    assert bu._as_dt("不是时间") is None
+    # 模板用字符串时间也能填
+    out = bu.format_template("{date} {time}", anchor="x", when="2026-11-03T20:32:05")
+    assert out == "2026-11-03 20:32", out
+
+
 def main() -> int:
     test_guard_fires()
     test_guard_touch_keeps_alive()
     test_guard_same_done_not_counted()
     test_retry_then_give_up()
     test_retry_then_success()
-    print("OK：卡住检测（触发/心跳/去重）+ 丢弃重传（重试/放弃/成功）全部通过")
+    test_returned_but_fired()
+    test_as_dt()
+    print("OK：卡住检测（触发/心跳/去重/取消后返回空）+ 丢弃重传 + 时间字符串兜底 全部通过")
     return 0
 
 

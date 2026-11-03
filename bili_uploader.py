@@ -1386,6 +1386,22 @@ async def _do_append(bvid: str, paths: list[Path], *, cfg: BiliConfig, cred,
     return {"bvid": bvid, "pages": len(videos), "added": len(paths)}
 
 
+def _as_dt(v):
+    """把「可能是字符串」的时间转回 datetime。
+
+    补传时从 bili_failed_uploads.json 读回来的 start 是 isoformat 字符串，
+    直接丢给 format_template 会 AttributeError: 'str' object has no attribute 'strftime'。
+    """
+    if isinstance(v, datetime):
+        return v
+    if isinstance(v, str) and v.strip():
+        try:
+            return datetime.fromisoformat(v.strip())
+        except ValueError:
+            return None
+    return None
+
+
 def format_template(tpl: str, anchor: str, title: str = "", room_id: str = "",
                     quality: str = "", when: datetime | None = None,
                     parts: int = 1, part: int = 1, seg: int = 1,
@@ -1396,7 +1412,8 @@ def format_template(tpl: str, anchor: str, title: str = "", room_id: str = "",
     end / dur 是给分P 标题用的：这一段的结束时间、时长（秒）。
     end 为 None（时长没探出来）时 {end} 填空串，{dur} 也空。
     """
-    when = when or datetime.now()
+    when = _as_dt(when) or datetime.now()
+    end = _as_dt(end)
     try:
         return tpl.format(
             anchor=anchor or "主播", title=title or "", room_id=room_id or "",
@@ -1462,9 +1479,9 @@ def part_titles(cfg: BiliConfig, count: int, *, seg_start: datetime,
 
 
 
-def _run_upload_once(coro_factory, log: Callable):
+def _run_upload_once(coro_factory, log: Callable, timeout: float | None = None):
     """跑一次上传协程，带「卡住就取消」的看门狗。"""
-    guard = _StallGuard(on_stall=lambda why: log(
+    guard = _StallGuard(timeout or STALL_SECONDS, on_stall=lambda why: log(
         f"[!] 上传卡住：{why}，取消这次上传，丢弃已传的部分重新来"))
 
     async def runner():
@@ -1476,7 +1493,12 @@ def _run_upload_once(coro_factory, log: Callable):
             guard.stop()
 
     try:
-        return asyncio.run(runner())
+        result = asyncio.run(runner())
+        # bilibili_api 有时会把取消吞掉、返回空 dict —— 光看返回值会误判成
+        # 「投稿没有返回 bvid」。看门狗真的响过，就按卡住处理，交给上层重传。
+        if guard._fired:
+            raise UploadStalled(f"{int(STALL_SECONDS // 60)} 分钟没有进度")
+        return result
     except asyncio.CancelledError as e:      # 被看门狗 cancel 掉
         raise UploadStalled(f"{int(STALL_SECONDS // 60)} 分钟没有进度") from e
     except Exception as e:
@@ -1546,6 +1568,8 @@ def upload_recording(
     返回 {"bvid", "appended", "pages"}；没有可投的文件时返回 None。
     任何可预期失败都抛 BiliError。
     """
+    when = _as_dt(when)          # 补传时这里是 isoformat 字符串
+
     try:
         import bilibili_api  # noqa: F401
     except ImportError as e:
@@ -1720,7 +1744,9 @@ def upload_recording(
         page_titles = [f"第{i}段" for i in range(1, len(to_upload) + 1)]
 
     # ---- ⑦ 上传（建新稿）
-    log(f"[i] 开始投稿第 {seg_index}/{seg_total} 段：{len(to_upload)} 个分P，"
+    seg_show = (f"第 {seg_index}/{seg_total} 段" if seg_total and seg_total > 0
+                else f"第 {seg_index} 段")
+    log(f"[i] 开始投稿{seg_show}：{len(to_upload)} 个分P，"
         f"共 {total_sec / 60:.1f} 分钟")
     log(f"    标题：{title}")
     if multi:
