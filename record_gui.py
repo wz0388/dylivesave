@@ -51,7 +51,8 @@ APP_DIR = app_dir()
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
-import record as rec                                    # noqa: E402
+import douyin_api as dy                                  # noqa: E402
+import record as rec                                     # noqa: E402
 import bili_uploader as bu                              # noqa: E402
 import qqbot as qb                                      # noqa: E402
 
@@ -188,6 +189,7 @@ class Bridge(QObject):
     progress = Signal(int, str, int, str, int, int, str)
     botlog = Signal(str)            # 机器人自己的日志（连接/断线/报错）
     notice = Signal(str)            # 需要推给 QQ 的事件（上传卡住等）
+    anchor_name = Signal(int, str)  # 解析到主播昵称（row 的 id, 昵称）
     ui_call = Signal(object)        # 机器人线程要改界面时，把函数丢过来在 GUI 线程执行
 
 
@@ -263,6 +265,9 @@ class RoomRow(QFrame):
         bottom = QHBoxLayout()
         bottom.setContentsMargins(22, 0, 0, 0)
         bottom.setSpacing(10)
+        self.name = BodyLabel("")
+        self.name.setToolTip("主播昵称（添加后自动解析；开播日志里也会更新）")
+        bottom.addWidget(self.name)
         self.state = CaptionLabel("● 未启动")
         self.progress = CaptionLabel("")
         self.progress.setFont(QFont("Microsoft YaHei UI", 9))
@@ -299,6 +304,14 @@ class RoomRow(QFrame):
         page = getattr(self.app, "anchor_pages", {}).get(id(self))
         if page is not None:
             page.set_state(text, kind)
+
+    def set_anchor(self, name: str) -> None:
+        """设置主播昵称：总监控那一行、主播页标题、左侧导航一起更新。"""
+        self.anchor = (name or "").strip()
+        self.name.setText(self.anchor)
+        page = getattr(self.app, "anchor_pages", {}).get(id(self))
+        if page is not None:
+            page.refresh_title()
 
     def set_season(self, season) -> None:
         self.season = season
@@ -695,6 +708,7 @@ class MainWindow(FluentWindow):
         self.bridge.progress.connect(self._on_upload_event)
         self.bridge.botlog.connect(self._on_bot_log)
         self.bridge.notice.connect(self._on_bot_notice)
+        self.bridge.anchor_name.connect(self._on_anchor_name)
         self.bridge.ui_call.connect(lambda fn: fn())
 
         self.setWindowTitle("抖音直播录制 → B 站投稿")
@@ -1210,6 +1224,7 @@ class MainWindow(FluentWindow):
                             on_bind=self._on_bind, on_unbind=self._on_unbind,
                             on_grant=self._on_grant,
                             on_screenshot=self._on_screenshot,
+                            on_bili_login=self._on_bili_login,
                             on_status=lambda s: self.bridge.botlog.emit(f"[状态] {s}"))
         self.bot.start()
         self.lbl_bot_state.setText("启动中…")
@@ -1305,6 +1320,110 @@ class MainWindow(FluentWindow):
             return
         self._bot_append(text)
 
+    def _resolve_anchor_name(self, row: RoomRow) -> None:
+        """添加/启动时顺手查一下主播昵称（抖音接口），查到就填进总监控那一行。"""
+        raw = row.room.text().strip()
+        if not raw or row.anchor:
+            return
+        try:
+            rid = rec.parse_rid(raw)
+        except Exception:
+            return
+        if not rid:
+            return
+
+        def work():
+            try:
+                info = dy.fetch_room_info(rid)
+                name = (getattr(info, "anchor", "") or "").strip()
+            except Exception:
+                return
+            if name:
+                self.bridge.anchor_name.emit(id(row), name)
+
+        threading.Thread(target=work, name="anchor-name", daemon=True).start()
+
+    def _on_anchor_name(self, row_id: int, name: str) -> None:
+        for r in self.rows:
+            if id(r) == row_id:
+                if name and r.anchor != name:
+                    r.set_anchor(name)
+                break
+
+    def _on_bili_login(self, idx: int, target) -> str:
+        """QQ 的 #登录bili 命令：给第 idx 个主播扫码登录（用它自己的 bili.toml/凭据）。"""
+        info = self._ui_call(lambda: self._login_target(idx), timeout=10)
+        if not isinstance(info, dict):
+            return str(info)
+        threading.Thread(target=self._bili_login_worker, args=(info, target),
+                         name="bili-login", daemon=True).start()
+        return ""
+
+    def _login_target(self, idx: int):
+        if idx < 1 or idx > len(self.rows):
+            return f"只有 {len(self.rows)} 个主播，没有第 {idx} 个"
+        row = self.rows[idx - 1]
+        return {"cfg": row.bili_config or "", "label": self._row_label(row)}
+
+    def _bot_say(self, target, text: str) -> None:
+        bot = getattr(self, "bot", None)
+        if bot is not None:
+            bot.send_text_to(target, text)
+        self.bridge.uplog.emit(f"[i] {text}")
+
+    def _bot_send_image(self, target, path: str, caption: str) -> None:
+        bot = getattr(self, "bot", None)
+        if bot is not None:
+            bot.send_image_to(target, path, caption)
+
+    def _bili_login_worker(self, info: dict, target) -> None:
+        """后台线程：取二维码 → 发图 → 轮询 → 存到该主播的凭据文件。"""
+        label = info.get("label") or "主播"
+        qr = bu.QrLogin()
+        try:
+            link = qr.begin()
+        except Exception as e:
+            self._bot_say(target, f"获取二维码失败：{e}")
+            return
+        try:
+            import qrcode
+            img = qrcode.make(link).convert("RGB")
+            path = Path(tempfile.gettempdir()) / f"bili_login_{int(time.time())}.png"
+            img.save(str(path))
+        except Exception as e:
+            self._bot_say(target, f"生成二维码图片失败：{e}")
+            return
+        self._bot_send_image(target, str(path),
+                             f"B 站扫码登录 · {label}\n用 B 站 App 扫一扫并点确认")
+        deadline = time.time() + 165
+        while time.time() < deadline:
+            try:
+                st = qr.poll()
+            except Exception as e:
+                self._bot_say(target, f"查询扫码状态失败：{e}")
+                return
+            if st == "done":
+                break
+            if st == "timeout":
+                self._bot_say(target, f"二维码过期了，重新发「#登录bili {label}」那一行对应的序号")
+                return
+            time.sleep(2)
+        else:
+            self._bot_say(target, "等太久了（超过 2 分半），重新发一次 #登录bili 吧")
+            return
+        try:
+            cfg, _ = bu.load_config(info["cfg"]) if info.get("cfg") else bu.load_config()
+            cred = qr.save(cfg.cred_file)
+            who = qr.verify() or "（昵称未知）"
+        except Exception as e:
+            self._bot_say(target, f"登录失败：{e}")
+            return
+        if not (cred or {}).get("sessdata"):
+            self._bot_say(target, "登录态不完整，请重试")
+            return
+        self._bot_say(target, f"✅ 登录成功：{who}\n已绑定到 {label}\n凭据：{cfg.cred_file.name}")
+        self.bridge.uplog.emit(f"[√] B 站登录成功：{who} → {label}（{cfg.cred_file}）")
+
     def _on_screenshot(self, idx: int):
         """QQ 的 #截图 命令：切到那个主播的分页、截整窗，返回 (路径, 标题)。"""
         res = self._ui_call(lambda: self._screenshot_ui(idx), timeout=15.0)
@@ -1372,10 +1491,9 @@ class MainWindow(FluentWindow):
                 return "还没添加主播"
             lines = []
             for i, r in enumerate(self.rows, 1):
-                room = r.room.text().strip() or "（空）"
                 flag = "  ● 录制中" if r.running else ""
                 season = f"  合集《{r.season['title']}》" if r.season else ""
-                lines.append(f"#{i} {room}{flag}{season}")
+                lines.append(f"#{i} {self._row_label(r)}{flag}{season}")
             return "现在的主播：\n" + "\n".join(lines)
 
         if cmd == "状态":
@@ -1386,13 +1504,10 @@ class MainWindow(FluentWindow):
             for i, r in enumerate(self.rows, 1):
                 room = r.room.text().strip()
                 rid = r.rid or room or "?"
+                label = self._row_label(r)
                 if not r.running:
-                    label = room or "（空）"
-                    label = label if label == str(rid) else f"{label}（{rid}）"
                     lines.append(f"#{i} {label} · 未在录")
                     continue
-                name = str(r.anchor or room or rid)
-                label = name if name == str(rid) else f"{name}（{rid}）"
                 if r.mode == "recording":
                     rec_n += 1
                     st = "录制中"
@@ -1429,14 +1544,15 @@ class MainWindow(FluentWindow):
                 return f"解析不了这个直播间：{e}"
             for r in self.rows:
                 if r.room.text().strip() and r.room.text().strip() == room:
-                    return f"{room} 已经在列表里了（第 {r.idx} 行）"
+                    return f"{self._row_label(r)} 已经在列表里了（第 {r.idx} 行）"
             if quality and quality not in QUALITY_LABEL.values():
                 quality = ""
             row = self.add_row(room, quality, "", None)
             self.append_log(f"[i] QQ 机器人添加了主播：{rid} → 第 {row.idx} 行")
             self._save_settings()
-            return (f"已添加：{room}（第 {row.idx} 行"
-                    + (f"，清晰度 {row.quality.currentText()}" if quality else "") + "）")
+            return (f"已添加：{self._row_label(row)}（第 {row.idx} 行"
+                    + (f"，清晰度 {row.quality.currentText()}" if quality else "")
+                    + "）\n昵称正在解析，几秒后发「状态」就能看到")
 
         if cmd == "删除":
             key = arg.strip().lstrip("#")
@@ -1452,7 +1568,7 @@ class MainWindow(FluentWindow):
                     break
             if target is None:
                 return f"没找到：{key}（发「列表」看看）"
-            who = target.room.text().strip() or f"第 {target.idx} 行"
+            who = self._row_label(target)
             self.del_row(target)
             self.append_log(f"[i] QQ 机器人删除了主播：{who}")
             return f"已删除：{who}"
@@ -1466,6 +1582,15 @@ class MainWindow(FluentWindow):
             return
         stamp = time.strftime("%m-%d %H:%M:%S")
         bot.notify(f"[{stamp}] {text}")
+
+    @staticmethod
+    def _row_label(r) -> str:
+        """给 QQ 回复用的「主播名（房间号）」；名字还没解析出来就只给房间号。"""
+        rid = (r.rid or r.room.text().strip() or "").strip()
+        name = (r.anchor or "").strip()
+        if name and name != rid:
+            return f"{name}（{rid}）"
+        return rid or "（空）"
 
     def _page_for(self, key: str):
         """按 tag / 主播名 / 房间号 找这个主播的分页。"""
@@ -1519,14 +1644,11 @@ class MainWindow(FluentWindow):
             body = line[len(tag):]
             if "主播：" in body and "·" in body:
                 try:
-                    r.anchor = body.split("主播：", 1)[1].split("·")[0].strip()
+                    r.set_anchor(body.split("主播：", 1)[1].split("·")[0].strip())
                 except Exception:
                     pass
                 r.mode = "recording"
                 r.set_state("● 录制中", "ok")
-                pg = self.anchor_pages.get(id(r))
-                if pg is not None:
-                    pg.refresh_title()
             elif "开始录制 →" in body or "  已写 " in body:
                 r.mode = "recording"
                 r.set_state("● 录制中", "ok")
@@ -1591,6 +1713,7 @@ class MainWindow(FluentWindow):
         self.addSubInterface(page, FIF.PEOPLE, title)
         row.room.editingFinished.connect(page.refresh_title)
         self._apply_page_bg()
+        self._resolve_anchor_name(row)
 
         self._sync_state()
         return row

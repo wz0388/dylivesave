@@ -117,13 +117,16 @@ class QQBot:
                  on_bind: Callable[[str, str, str], str] | None = None,
                  on_unbind: Callable[[str, str], str] | None = None,
                  on_grant: Callable[[str, bool], str] | None = None,
-                 on_screenshot: Callable[[int], tuple] | None = None):
+                 on_screenshot: Callable[[int], tuple] | None = None,
+                 on_bili_login: Callable[[int, tuple], str] | None = None):
         ensure_bind_code(cfg)
         self.on_bind = on_bind
         self.on_unbind = on_unbind
         self.on_grant = on_grant
         #: 截图回调：on_screenshot(序号) -> (图片路径, 标题)；失败返回 ("", 原因)
         self.on_screenshot = on_screenshot
+        #: B 站扫码登录：on_bili_login(序号, 会话) -> 错误串（空串=已开始，界面自己推二维码）
+        self.on_bili_login = on_bili_login
         self.cfg = cfg
         self.log = log
         self.handler = handler
@@ -376,6 +379,11 @@ class QQBot:
                 mentions.append({"openid": str(oid),
                                  "nickname": m.get("nickname") or ""})
         first = text.split()[0].lower() if text.split() else ""
+        if first in ("登录bili", "bili登录", "loginbili"):
+            self.stats["commands"] += 1
+            await self._handle_bili_login(text, target, d, at, user)
+            return
+
         if first in ("截图", "screenshot", "shot"):
             self.stats["commands"] += 1
             await self._handle_screenshot(text, target, d, at, user)
@@ -413,6 +421,7 @@ class QQBot:
                     f"{p}列表 —— 看现在在录哪些主播\n"
                     f"{p}状态 —— 录制/上传概况\n"
                     f"{p}截图 序号 —— 把这个主播的页面截一张发过来\n"
+                    f"{p}登录bili 序号 —— 给这个主播扫码登录 B 站（用它自己的凭据）\n"
                     f"{p}添加 房间号 [清晰度] —— 添加主播\n"
                     f"{p}删除 房间号 —— 删除主播\n"
                     f"{p}绑定 绑定码 —— 把通知发到这里（码在电脑端面板）\n"
@@ -523,6 +532,53 @@ class QQBot:
             return
         ok = await self._send_image(target, path, d, caption=title)
         self.log(f"[i] 截图已发送：{title}" if ok else "[!] 截图发送失败")
+
+    async def _handle_bili_login(self, text: str, target, d: dict, at: str,
+                                 user: str) -> None:
+        p = self.cfg.prefix or "#"
+        parts = text.split()
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        if not arg.isdigit():
+            await self._reply(target, at + f"用法：{p}登录bili 序号（比如 {p}登录bili 1）", d, 2)
+            return
+        if not self.cfg.allow_manage:
+            await self._reply(target, at + "管理员没打开「允许机器人操作」，登不了", d, 2)
+            return
+        gate = set(self.cfg.masters) | set(self.cfg.admins)
+        if gate and user not in gate:
+            await self._reply(target, at + "你没有权限登录", d, 2)
+            return
+        if self.on_bili_login is None:
+            await self._reply(target, at + "界面没接上，登不了", d, 2)
+            return
+        err = self.on_bili_login(int(arg), target)
+        if err:
+            await self._reply(target, at + err, d, 2)
+
+    def send_text_to(self, target, text: str) -> None:
+        """从别的线程发一条主动消息（不占被动回复次数）。"""
+        loop = self._loop
+        if loop is None or not target or not target[1]:
+            return
+
+        async def _do():
+            await self._post(self._target_path(target),
+                             {"content": text, "msg_type": 0})
+        try:
+            asyncio.run_coroutine_threadsafe(_do(), loop)
+        except Exception:
+            pass
+
+    def send_image_to(self, target, path: str, caption: str = "") -> None:
+        """从别的线程发一张图（先传富媒体再发）。"""
+        loop = self._loop
+        if loop is None or not target or not target[1]:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._send_image(target, path, None, caption), loop)
+        except Exception:
+            pass
 
     async def _send_image(self, target, path: str, d: dict | None = None,
                           caption: str = "") -> bool:

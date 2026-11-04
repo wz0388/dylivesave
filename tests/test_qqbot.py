@@ -265,6 +265,39 @@ def main() -> int:
     assert any(c[0] == "reply" and "用法" in c[1] for c in calls), calls
 
 
+    # ---- 10g. #登录bili：参数/权限/回调
+    logins = []
+
+    def _mk_login_bot(master="U1", allow=True):
+        b = qb.QQBot(qb.BotConfig(app_id="a", client_secret="s", groups=["G1"]),
+                     log=lambda *a: None, handler=handler,
+                     on_bili_login=lambda i, t: (logins.append((i, t)), "")[1])
+        b.cfg.allow_manage = allow
+        b.cfg.masters = [master]
+
+        async def _post(path, body):
+            calls.append((path, dict(body)))
+        b._post = _post
+
+        async def _reply(target, content, d, seq=1):
+            calls.append(("reply", content))
+        b._reply = _reply
+        return b
+
+    calls.clear(); logins.clear()
+    b8 = _mk_login_bot()
+    asyncio.run(b8._handle_bili_login("登录bili 2", ("group", "G1"), {"id": "M"}, "", "U1"))
+    assert logins == [(2, ("group", "G1"))], logins
+    assert not calls, calls                       # 成功时不回文字（界面自己推二维码）
+
+    asyncio.run(b8._handle_bili_login("登录bili", ("group", "G1"), {"id": "M"}, "", "U1"))
+    assert any(c[0] == "reply" and "用法" in c[1] for c in calls), calls
+
+    calls.clear(); logins.clear()
+    b9 = _mk_login_bot(master="BOSS")
+    asyncio.run(b9._handle_bili_login("登录bili 1", ("group", "G1"), {"id": "M"}, "", "U9"))
+    assert not logins and any(c[0] == "reply" and "没有权限" in c[1] for c in calls), calls
+
     # ---- 11. 界面侧：机器人指令真的能加/删主播
     test_gui()
 
@@ -328,6 +361,19 @@ def test_gui() -> None:
         assert "01:23:45" in txt and "李大霄" in txt, txt
         row0.running = False
         row0.set_progress("")
+
+        # 主播名：解析到之后，行内/导航/页标题都更新；回复里带名字而不是纯数字
+        row = w.rows[0]
+        row.room.setText("50141210842")
+        row.rid = "50141210842"
+        row.set_anchor("")            # 先清掉前面用例可能设置过的昵称
+        assert w._row_label(row) == "50141210842", w._row_label(row)
+        row.set_anchor("李大霄")
+        assert "李大霄" in w._row_label(row) and "50141210842" in w._row_label(row)
+        assert "李大霄" in w._bot_command_ui("列表", "", "u1"), w._bot_command_ui("列表", "", "u1")
+        info = w._login_target(1)
+        assert isinstance(info, dict) and "李大霄" in info["label"], info
+        assert "没有第 9 个" in w._login_target(9)
 
         # 界面截图：切到主播页并落盘一个 PNG
         shot_path, shot_title = w._screenshot_ui(1)
