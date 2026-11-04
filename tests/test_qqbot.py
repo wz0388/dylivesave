@@ -12,6 +12,7 @@
 """
 import asyncio
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -218,6 +219,52 @@ def main() -> int:
     run(b5, etype, payload)
     assert any("张三" in x and "#列表" in x and "群聊" in x for x in logs), logs
 
+    # ---- 10f. #截图：先传富媒体（file_type=1），再用 msg_type=7 发图
+    import base64 as _b64
+    from pathlib import Path as _P
+    img = _P(tempfile.mkdtemp()) / "shot.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 64)
+
+    calls = []
+
+    def _mk_bot(master="U1"):
+        b = qb.QQBot(qb.BotConfig(app_id="a", client_secret="s", groups=["G1"]),
+                     log=lambda *a: None, handler=handler,
+                     on_screenshot=lambda i: (str(img), f"#{i} 李大霄"))
+        b.cfg.allow_manage = True
+        b.cfg.masters = [master]
+
+        async def _post(path, body):
+            calls.append((path, dict(body)))
+            return {"file_info": "FI123", "ttl": 300} if path.endswith("/files") \
+                else {"id": "MSG1"}
+        b._post = _post
+
+        async def _reply(target, content, d, seq=1):
+            calls.append(("reply", content))
+        b._reply = _reply
+        return b
+
+    b6 = _mk_bot()
+    asyncio.run(b6._handle_screenshot("截图 1", ("group", "G1"), {"id": "M1"}, "", "U1"))
+    posts = [c for c in calls if c[0] != "reply"]
+    assert posts[0][0] == "/v2/groups/G1/files", posts
+    assert posts[0][1]["file_type"] == 1 and posts[0][1]["srv_send_msg"] is False
+    assert _b64.b64decode(posts[0][1]["file_data"]) == img.read_bytes()
+    assert posts[1][0] == "/v2/groups/G1/messages", posts
+    assert posts[1][1]["msg_type"] == 7 and posts[1][1]["media"]["file_info"] == "FI123"
+    assert posts[1][1]["msg_id"] == "M1" and posts[1][1]["msg_seq"] == 3
+
+    # 没权限 / 没序号 / 序号越界
+    calls.clear()
+    b7 = _mk_bot(master="BOSS")
+    asyncio.run(b7._handle_screenshot("截图 1", ("group", "G1"), {"id": "M1"}, "", "U9"))
+    assert any(c[0] == "reply" and "没有权限" in c[1] for c in calls), calls
+    calls.clear()
+    asyncio.run(b6._handle_screenshot("截图", ("group", "G1"), {"id": "M1"}, "", "U1"))
+    assert any(c[0] == "reply" and "用法" in c[1] for c in calls), calls
+
+
     # ---- 11. 界面侧：机器人指令真的能加/删主播
     test_gui()
 
@@ -281,6 +328,14 @@ def test_gui() -> None:
         assert "01:23:45" in txt and "李大霄" in txt, txt
         row0.running = False
         row0.set_progress("")
+
+        # 界面截图：切到主播页并落盘一个 PNG
+        shot_path, shot_title = w._screenshot_ui(1)
+        if len(w.rows) >= 1:
+            assert shot_path and Path(shot_path).is_file(), (shot_path, shot_title)
+            assert shot_path.endswith(".png")
+        else:
+            assert shot_path == "" and "只有" in shot_title
 
         # 通知要带时间戳（年月日 时分秒）
         class _FakeBot:

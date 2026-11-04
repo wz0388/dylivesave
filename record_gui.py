@@ -19,6 +19,7 @@
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -1208,6 +1209,7 @@ class MainWindow(FluentWindow):
                             handler=self._bot_command,
                             on_bind=self._on_bind, on_unbind=self._on_unbind,
                             on_grant=self._on_grant,
+                            on_screenshot=self._on_screenshot,
                             on_status=lambda s: self.bridge.botlog.emit(f"[状态] {s}"))
         self.bot.start()
         self.lbl_bot_state.setText("启动中…")
@@ -1302,6 +1304,32 @@ class MainWindow(FluentWindow):
                     f"收到 {st['events']} 条 · 指令 {st['commands']} · 发出 {st['sent']}")
             return
         self._bot_append(text)
+
+    def _on_screenshot(self, idx: int):
+        """QQ 的 #截图 命令：切到那个主播的分页、截整窗，返回 (路径, 标题)。"""
+        res = self._ui_call(lambda: self._screenshot_ui(idx), timeout=15.0)
+        return res if isinstance(res, tuple) else ("", str(res))
+
+    def _screenshot_ui(self, idx: int):
+        if idx < 1 or idx > len(self.rows):
+            return "", f"只有 {len(self.rows)} 个主播，没有第 {idx} 个"
+        row = self.rows[idx - 1]
+        page = self.anchor_pages.get(id(row))
+        if page is None:
+            return "", "这个主播还没有分页"
+        try:
+            self.switchTo(page)
+            QApplication.processEvents()
+            pm: QPixmap = self.grab()          # 带左侧导航的整窗
+            name = row.anchor or row.room.text().strip() or str(row.rid or idx)
+            path = Path(tempfile.gettempdir()) / f"anchor_{idx}_{int(time.time())}.png"
+            if not pm.save(str(path), "PNG"):
+                return "", "截图保存失败"
+            title = f"#{idx} {name}"
+            self.append_log(f"[i] 已截图：{title}")
+            return str(path), title
+        except Exception as e:
+            return "", f"截图出错：{type(e).__name__}: {e}"
 
     def _on_bot_notice(self, text: str) -> None:
         """上传卡住之类的事件：机器人页记一笔，同时推 QQ。"""

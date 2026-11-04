@@ -21,6 +21,7 @@ QQ 官方机器人（API v2）· 通知 + 管理
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import threading
 import time
@@ -115,11 +116,14 @@ class QQBot:
                  on_status: Callable[[str], None] | None = None,
                  on_bind: Callable[[str, str, str], str] | None = None,
                  on_unbind: Callable[[str, str], str] | None = None,
-                 on_grant: Callable[[str, bool], str] | None = None):
+                 on_grant: Callable[[str, bool], str] | None = None,
+                 on_screenshot: Callable[[int], tuple] | None = None):
         ensure_bind_code(cfg)
         self.on_bind = on_bind
         self.on_unbind = on_unbind
         self.on_grant = on_grant
+        #: 截图回调：on_screenshot(序号) -> (图片路径, 标题)；失败返回 ("", 原因)
+        self.on_screenshot = on_screenshot
         self.cfg = cfg
         self.log = log
         self.handler = handler
@@ -371,6 +375,12 @@ class QQBot:
             if oid:
                 mentions.append({"openid": str(oid),
                                  "nickname": m.get("nickname") or ""})
+        first = text.split()[0].lower() if text.split() else ""
+        if first in ("截图", "screenshot", "shot"):
+            self.stats["commands"] += 1
+            await self._handle_screenshot(text, target, d, at, user)
+            return
+
         reply = self._run_command(text, user, target, mentions)
         self.stats["commands"] += 1
         await self._reply(target, at + reply, d)
@@ -402,6 +412,7 @@ class QQBot:
             return ("可用指令：\n"
                     f"{p}列表 —— 看现在在录哪些主播\n"
                     f"{p}状态 —— 录制/上传概况\n"
+                    f"{p}截图 序号 —— 把这个主播的页面截一张发过来\n"
                     f"{p}添加 房间号 [清晰度] —— 添加主播\n"
                     f"{p}删除 房间号 —— 删除主播\n"
                     f"{p}绑定 绑定码 —— 把通知发到这里（码在电脑端面板）\n"
@@ -484,6 +495,65 @@ class QQBot:
                 body["message_reference"] = {"message_id": item.split("=", 1)[1]}
                 break
         await self._post(self._target_path(target), body)
+
+    # ─────────────────── 截图 ───────────────────
+    async def _handle_screenshot(self, text: str, target, d: dict, at: str,
+                                 user: str) -> None:
+        p = self.cfg.prefix or "#"
+        parts = text.split()
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        if not arg.isdigit():
+            await self._reply(target, at + f"用法：{p}截图 序号（比如 {p}截图 1）", d, 2)
+            return
+        if not self.cfg.allow_manage:
+            await self._reply(target, at + "管理员没打开「允许机器人操作」，截不了图", d, 2)
+            return
+        gate = set(self.cfg.masters) | set(self.cfg.admins)
+        if gate and user not in gate:
+            await self._reply(target, at + "你没有权限截图", d, 2)
+            return
+        if self.on_screenshot is None:
+            await self._reply(target, at + "界面没接上，截不了图", d, 2)
+            return
+        idx = int(arg)
+        res = self.on_screenshot(idx)
+        path, title = res if isinstance(res, tuple) else ("", str(res))
+        if not path:
+            await self._reply(target, at + (title or f"没有第 {idx} 个主播"), d, 2)
+            return
+        ok = await self._send_image(target, path, d, caption=title)
+        self.log(f"[i] 截图已发送：{title}" if ok else "[!] 截图发送失败")
+
+    async def _send_image(self, target, path: str, d: dict | None = None,
+                          caption: str = "") -> bool:
+        """先传到 QQ 的富媒体（file_type=1），再用 msg_type=7 发出去。"""
+        kind, oid = target
+        try:
+            data = Path(path).read_bytes()
+        except Exception as e:
+            self.log(f"[!] 读不了截图：{e}")
+            return False
+        if len(data) > 4_800_000:            # 二进制直传上限 5MB
+            self.log("[!] 截图太大，压一下再发")
+            return False
+        up = await self._post(
+            f"/v2/{'groups' if kind == 'group' else 'users'}/{oid}/files",
+            {"file_type": 1, "file_name": Path(path).name,
+             "file_data": base64.b64encode(data).decode(), "srv_send_msg": False})
+        info = (up or {}).get("file_info") or ""
+        if not info:
+            self.log(f"[!] 富媒体上传失败：{(up or {}).get('code')} {(up or {}).get('message')}")
+            return False
+        body = {"content": caption or "", "msg_type": 7, "media": {"file_info": info}}
+        if d and d.get("id"):
+            body["msg_id"] = d["id"]
+            body["msg_seq"] = 3
+            for item in ((d.get("message_scene") or {}).get("ext") or []):
+                if isinstance(item, str) and item.startswith("msg_idx="):
+                    body["message_reference"] = {"message_id": item.split("=", 1)[1]}
+                    break
+        sent = await self._post(self._target_path(target), body)
+        return bool((sent or {}).get("id"))
 
     async def _post(self, path: str, body: dict) -> dict:
         if self._session is None:
